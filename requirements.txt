@@ -1,0 +1,28 @@
+# SOLLOL - Self-Organizing Local Large-model Orchestrator Layer
+sollol>=0.9.52
+
+# Core Dependencies
+streamlit==1.40.2
+Pillow==11.3.0
+PyPDF2==3.0.1
+python-docx==1.1.2
+prefect==2.20.10
+redis==5.2.1
+psycopg2-binary==2.9.10
+sqlalchemy==2.0.36
+chromadb==0.5.23
+ollama==0.5.3
+ray[train,tune]==2.40.0
+pydantic==2.10.4
+httpx==0.28.1
+asyncio-pool==0.6.0
+fastapi==0.115.6
+uvicorn==0.34.0
+numpy==1.26.4
+pandas==2.2.3
+tenacity==9.0.0
+loguru==0.7.3
+python-dotenv==1.0.1
+aiofiles==24.1.0
+asyncpg==0.30.0
+aiosqlite==0.20.0
