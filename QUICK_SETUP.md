@@ -1,202 +1,267 @@
-# 🚀 Quick Setup - 4 PC Cluster
+# Quick Setup Guide
 
-## Your Setup
-- **Main PC (Coordinator)**: 10.9.66.90 - Manages everything
-- **Worker PC 1**: 10.9.66.154 - Runs models
-- **Worker PC 2**: [Your IP] - Runs models
-- **Worker PC 3**: [Your IP] - Runs models
-- **Worker PC 4**: [Your IP] - Runs models
+## Single Node Setup (5 minutes)
 
-All PCs work together, sharing the load and running different models in parallel!
+For development or testing on a single machine.
 
----
-
-## Step 1: Start the Main PC (10.9.66.90)
+### 1. Install Dependencies
 
 ```bash
-# On the main PC (10.9.66.90):
-cd ~/hydra/scripts
-./host_node.sh quick
+cd hydra
 
-# Or if already set up, just start it:
-./host_node.sh start
+# Install Python packages
+pip install -r requirements.txt
+
+# Install Ollama (if not already installed)
+curl -fsSL https://ollama.ai/install.sh | sh
 ```
 
-Keep this running! This is the brain that coordinates all workers.
-
----
-
-## Step 2: Set Up Each Worker PC (One by One)
-
-On each worker PC, run this ONE command:
+### 2. Pull Required Models
 
 ```bash
-# Quick deploy (already configured for 10.9.66.90):
-cd ~/hydra/scripts
-./deploy_node.sh --quick
+# Minimum required models
+ollama pull qwen3:1.7b    # Light orchestrator (~1GB)
+ollama pull qwen3:14b     # Heavy orchestrator (~9GB)
+ollama pull llama3.2      # Default worker model (~2GB)
 ```
 
-That's it! The script will:
-- Install Ollama
-- Configure network access
-- Connect to main PC at 10.9.66.90
-- Start running automatically
-- Models are pulled dynamically when needed!
+### 3. Configure Environment
 
-**For Worker 1 (10.9.66.154):** Already done!
-**For Worker 2:** Run the command above
-**For Worker 3:** Run the command above  
-**For Worker 4:** Run the command above
-
----
-
-## How It Works
-
-```
-Main PC (10.9.66.90)
-    ├── Receives requests
-    ├── Picks best worker for each model
-    └── Distributes work to:
-        ├── Worker 1: Runs Model A
-        ├── Worker 2: Runs Model B (parallel)
-        ├── Worker 3: Runs Model C (parallel)
-        └── Worker 4: Runs Model D (parallel)
-
-All workers run different models AT THE SAME TIME!
-```
-
----
-
-## Check Everything is Working
-
-### On Main PC:
 ```bash
-# See all connected workers:
-curl http://localhost:8001/nodes
-
-# Monitor the cluster:
-cd ~/hydra/scripts
-python monitor_cluster.py
+cp .env.example .env
+# Edit .env if you want to customize ports or enable databases
 ```
 
-### On Any Worker:
+**Default configuration works for single-node setup.** No editing needed unless you want:
+- PostgreSQL integration
+- Redis caching
+- Custom ports
+
+### 4. Start the System
+
 ```bash
-# Check worker status:
-curl http://localhost:8002/status
-
-# See logs:
-sudo journalctl -u hydra-node -f
+# Start API server
+python main.py api
 ```
+
+In another terminal:
+```bash
+# Start web interface
+python main.py ui
+```
+
+### 5. Access Interfaces
+
+- **Web UI**: http://localhost:8501
+- **API**: http://localhost:8001
+- **SOLLOL Dashboard**: http://localhost:8080 (if enabled)
 
 ---
 
-## How Models Work (Automatic!)
+## Multi-Node Setup (15 minutes)
 
-**Models are loaded dynamically!** When the host requests a model:
-1. Worker checks if it has the model
-2. If not, downloads it automatically
-3. Runs the model
-4. Keeps it cached for next time
+For distributed inference across multiple machines on the same network.
 
-**No manual pulling needed!** Just request any model and workers will get it:
+### Prerequisites
 
-```python
-# From main PC - workers auto-download as needed:
-response = requests.post("http://localhost:8001/generate", json={
-    "model": "llama2:7b",  # Worker downloads if needed
-    "prompt": "Hello"
-})
+- 2+ machines on the same local network (e.g., 10.9.66.x subnet)
+- Ollama installed on each machine
+- Network connectivity between nodes
+
+### 1. On Each Worker Node
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Configure Ollama to listen on network (not just localhost)
+sudo systemctl edit ollama
+
+# Add these lines:
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+
+# Save and restart
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+
+# Open firewall
+sudo ufw allow 11434/tcp
+
+# Pull models (divide models across nodes to save disk space)
+ollama pull qwen3:1.7b
+ollama pull llama3.2
 ```
 
-### Available Models (auto-downloaded when requested):
-- **Small (4GB RAM)**: tinyllama, phi, gemma:2b
-- **Medium (8GB RAM)**: llama2:7b, mistral:7b, qwen2.5:7b  
-- **Large (16GB RAM)**: llama2:13b, qwen2.5:14b, mixtral:8x7b
+### 2. On Coordinator Node
+
+```bash
+cd hydra
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure for distributed mode
+cp .env.example .env
+
+# Edit .env and set:
+# SOLLOL_DISCOVERY_ENABLED=true
+# SOLLOL_VRAM_MONITORING=true
+# SOLLOL_DASHBOARD_ENABLED=true
+```
+
+### 3. Start Coordinator
+
+```bash
+python main.py api
+```
+
+The system will:
+1. Scan the local network for Ollama nodes
+2. Auto-discover available nodes
+3. Display discovered nodes in the logs
+
+Example output:
+```
+🚀 Initializing Hydra system with SOLLOL...
+📊 Discovered 3 Ollama nodes
+  - 10.9.66.154:11434 (healthy)
+  - 10.9.66.250:11434 (healthy)
+  - 10.9.66.90:11434 (healthy)
+🎨 SOLLOL Dashboard: http://localhost:8080
+📡 Hydra API: http://localhost:8001
+```
+
+### 4. Verify Distribution
+
+Check the SOLLOL dashboard at http://localhost:8080 to see:
+- All discovered nodes
+- Model availability per node
+- Resource usage
+- Request routing
 
 ---
 
-## Tips for Best Performance
+## Verification
 
-1. **Model Distribution**: Different workers can run different models
-   - Worker 1: Small fast models (tinyllama, phi)
-   - Worker 2: Code models (codellama, qwen-coder)
-   - Worker 3: General models (llama2, mistral)
-   - Worker 4: Large models (if enough RAM)
+### Test API
 
-2. **The system automatically**:
-   - Routes requests to the right worker
-   - Balances load across all PCs
-   - Falls back if a worker goes down
-   - Runs models in parallel for speed
-
-3. **If a worker disconnects**: Others keep working!
-
----
-
-## Common Commands
-
-### Start/Stop Worker:
 ```bash
-sudo systemctl start hydra-node    # Start
-sudo systemctl stop hydra-node     # Stop
-sudo systemctl status hydra-node   # Check status
+curl -X POST http://localhost:8001/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Write a Python function to reverse a string",
+    "temperature": 0.7
+  }'
 ```
 
-### Update Worker Code:
+### Test Web UI
+
+1. Open http://localhost:8501
+2. Enter a prompt in the chat interface
+3. Submit and wait for response
+
+### Check System Health
+
 ```bash
-cd ~/hydra
-git pull
-cd scripts
-./deploy_node.sh --quick
+curl http://localhost:8001/health
 ```
 
-### Test Parallel Processing:
-```python
-# From main PC, test multiple models at once:
-import requests
-
-# These all run IN PARALLEL on different workers!
-requests.post("http://localhost:8001/generate", json={
-    "model": "tinyllama",
-    "prompt": "Hello"
-})
-requests.post("http://localhost:8001/generate", json={
-    "model": "phi", 
-    "prompt": "Write code"
-})
-requests.post("http://localhost:8001/generate", json={
-    "model": "llama2:7b",
-    "prompt": "Explain AI"
-})
+Should return:
+```json
+{
+  "status": "healthy",
+  "components": {
+    "database": { ... },
+    "ollama": {
+      "healthy_hosts": 3
+    },
+    "distributed": { ... }
+  }
+}
 ```
 
 ---
 
 ## Troubleshooting
 
-### "Can't connect to coordinator"
+### No nodes discovered
+
+**Check Ollama is accessible:**
 ```bash
-# On worker, check coordinator is reachable:
-ping 10.9.66.90
-curl http://10.9.66.90:8001/health
+curl http://10.9.66.154:11434/api/tags
 ```
 
-### "Ollama not accessible"
+**Check firewall:**
 ```bash
-# Make sure Ollama listens on network:
-sudo systemctl restart ollama
-netstat -tln | grep 11434  # Should show 0.0.0.0:11434
+sudo ufw status
+sudo ufw allow 11434/tcp
 ```
 
-### "Out of memory"
-The system automatically picks smaller models! Or manually pull smaller ones:
+### "Connection refused" errors
+
+**Ensure Ollama is running:**
 ```bash
-ollama pull tinyllama  # Smallest
-ollama pull phi        # Still small
+systemctl status ollama
+sudo systemctl start ollama
+```
+
+### Slow responses
+
+**Check node health:**
+- Visit SOLLOL dashboard: http://localhost:8080
+- Look for unhealthy nodes or high load
+
+**Use smaller models:**
+- `qwen3:0.6b` instead of `qwen3:1.7b`
+- Reduce max_tokens in requests
+
+### Out of memory
+
+**Reduce batch size** or use smaller models:
+```yaml
+# In config/models.yaml
+orchestrator:
+  light:
+    model: qwen3:0.6b
 ```
 
 ---
 
-## 🎉 That's It!
+## Next Steps
 
-Your 4 PCs are now working together as one powerful AI cluster! Each can run different models simultaneously, sharing the computational load.
+- Read the full [README](README.md) for detailed documentation
+- Check [SOLLOL Integration Guide](SOLLOL_INTEGRATION_COMPLETE.md) for advanced distributed setup
+- Explore the API endpoints at http://localhost:8001/docs (FastAPI automatic docs)
+- Customize model selection in `config/models.yaml`
+
+---
+
+## Resource Requirements
+
+### Single Node
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| RAM | 8GB | 16GB+ |
+| CPU | 4 cores | 8+ cores |
+| Disk | 15GB | 30GB |
+| Models | 2-3 small models | 5+ varied models |
+
+### Multi-Node (3 nodes)
+
+| Per Node | Minimum | Recommended |
+|----------|---------|-------------|
+| RAM | 6GB | 12GB+ |
+| CPU | 4 cores | 6+ cores |
+| Disk | 10GB | 20GB |
+| Network | 100Mbps | 1Gbps |
+
+---
+
+## Support
+
+For issues or questions:
+1. Check the [README](README.md)
+2. Review [Troubleshooting](README.md#troubleshooting)
+3. Open an issue on GitHub
