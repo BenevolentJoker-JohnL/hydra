@@ -59,6 +59,7 @@ The system uses a lightweight-to-heavyweight model selection strategy:
 ### Prerequisites
 
 - Python 3.8+
+- Git (for version control and file edit tracking)
 - Ollama installed and running
 - PostgreSQL (optional, for persistent storage)
 - Redis (optional, for caching)
