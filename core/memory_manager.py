@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 from loguru import logger
+from .config_loader import load_model_config
 
 
 @dataclass
@@ -34,13 +35,14 @@ class MemoryManager:
         self.current_models = set()  # Track loaded models
         
     def _load_config(self, config_path: Path) -> Dict:
-        """Load model configuration"""
-        if not config_path.exists():
-            logger.warning(f"Config not found at {config_path}, using defaults")
+        """Load model configuration with environment variable overrides"""
+        try:
+            # Use config_loader to get config with env var overrides
+            config = load_model_config(str(config_path))
+            return config
+        except Exception as e:
+            logger.warning(f"Failed to load config from {config_path}: {e}, using defaults")
             return self._default_config()
-        
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
     
     def _default_config(self) -> Dict:
         """Default configuration for common models"""

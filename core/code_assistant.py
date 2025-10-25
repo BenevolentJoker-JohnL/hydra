@@ -6,12 +6,14 @@ Handles: Generation, Debugging, Explaining, Troubleshooting, Refactoring
 import re
 import ast
 import asyncio
+import json
 from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 from dataclasses import dataclass
 from loguru import logger
 from .json_pipeline import JSONPipeline, CodeResponseSchema, ExplanationResponseSchema, AnalysisResponseSchema
 from .memory_manager import get_memory_manager
+from .tools import ToolRegistry, ToolCaller, ApprovalTracker
 
 class CodeTaskType(Enum):
     """Types of code tasks we can handle"""
@@ -473,11 +475,25 @@ Include:
 
 class StreamingCodeAssistant(CodeAssistant):
     """Code assistant with streaming support"""
-    
-    async def process_stream(self, prompt: str, context: Dict = None):
+
+    def __init__(self, load_balancer):
+        super().__init__(load_balancer)
+        # Initialize tool registry and approval system
+        self.tool_registry = ToolRegistry()
+        self.approval_tracker = ApprovalTracker()
+        self.tool_caller = ToolCaller(self.tool_registry, self.approval_tracker)
+
+    async def process_stream(self, prompt: str, context: Dict = None, use_tools: bool = False):
         """Process with streaming output"""
         context = context or {}
-        
+
+        # If tools are enabled and task benefits from tools, use tool-enabled generation
+        if use_tools:
+            logger.info("🔧 Tool use enabled for this request")
+            async for chunk in self._process_stream_with_tools(prompt, context):
+                yield chunk
+            return
+
         # Detect task type
         task_type = self.detector.detect_task_type(prompt, context)
         logger.info(f"🎯 Streaming task: {task_type.value}")
@@ -534,4 +550,139 @@ class StreamingCodeAssistant(CodeAssistant):
                     }
                 else:
                     logger.info(f"Trying next model...")
+                    continue
+
+    async def _process_stream_with_tools(self, prompt: str, context: Dict = None):
+        """Process streaming with tool support"""
+        # Detect task type
+        task_type = self.detector.detect_task_type(prompt, context)
+        logger.info(f"🎯 Tool-enabled streaming task: {task_type.value}")
+
+        # Get appropriate models
+        models = self.task_models[task_type]
+
+        # Add tool information to prompt
+        enhanced_prompt = f"""{prompt}
+
+{self.tool_caller.format_tools_for_prompt()}
+
+You can use these tools to help complete the task. When you need to use a tool, include it in your response like this:
+```tool
+{{
+  "tool": "tool_name",
+  "parameters": {{
+    "param1": "value1"
+  }}
+}}
+```
+
+After using tools, continue with your response based on the tool results."""
+
+        # First pass: Stream initial response
+        full_response = ""
+        for i, model in enumerate(models):
+            try:
+                logger.info(f"🔧 Streaming with tools using {model}")
+
+                async for chunk in self.lb.generate_stream(
+                    model=model,
+                    prompt=enhanced_prompt
+                ):
+                    if 'response' in chunk:
+                        full_response += chunk['response']
+                        yield {
+                            'task_type': task_type.value,
+                            'chunk': chunk['response'],
+                            'model': model,
+                            'done': chunk.get('done', False)
+                        }
+                break
+            except Exception as e:
+                logger.warning(f"Model {model} failed: {e}")
+                if i == len(models) - 1:
+                    yield {
+                        'task_type': task_type.value,
+                        'chunk': f"\n\n⚠️ All models failed: {str(e)}\n",
+                        'model': 'error',
+                        'done': True,
+                        'error': True
+                    }
+                    return
+                continue
+
+        # Check for tool calls in the response
+        tool_calls = self.tool_caller.extract_tool_calls(full_response)
+
+        if tool_calls:
+            logger.info(f"🔧 Found {len(tool_calls)} tool call(s), executing...")
+
+            # Stream tool execution notification
+            yield {
+                'task_type': task_type.value,
+                'chunk': f"\n\n🔧 **Executing {len(tool_calls)} tool(s)...**\n\n",
+                'model': model,
+                'done': False,
+                'tool_execution': True
+            }
+
+            # Execute tool calls
+            tool_results = await self.tool_caller.execute_tool_calls(tool_calls)
+
+            # Stream tool results
+            for tool_call, result in zip(tool_calls, tool_results):
+                result_text = f"**Tool: {tool_call.get('tool')}**\n"
+                if result.get('success'):
+                    result_text += f"✅ Success\n```json\n{json.dumps(result, indent=2)}\n```\n\n"
+                else:
+                    result_text += f"❌ Error: {result.get('error', 'Unknown error')}\n\n"
+
+                yield {
+                    'task_type': task_type.value,
+                    'chunk': result_text,
+                    'model': model,
+                    'done': False,
+                    'tool_result': True
+                }
+
+            # Continue generation with tool results
+            follow_up_prompt = f"""Previous response with tool calls:
+{full_response}
+
+Tool execution results:
+{json.dumps(tool_results, indent=2)}
+
+Please continue with the task using these tool results. Provide a complete response incorporating the tool outputs."""
+
+            yield {
+                'task_type': task_type.value,
+                'chunk': "\n\n**Continuing with tool results...**\n\n",
+                'model': model,
+                'done': False
+            }
+
+            # Stream follow-up response
+            for i, model in enumerate(models):
+                try:
+                    async for chunk in self.lb.generate_stream(
+                        model=model,
+                        prompt=follow_up_prompt
+                    ):
+                        if 'response' in chunk:
+                            yield {
+                                'task_type': task_type.value,
+                                'chunk': chunk['response'],
+                                'model': model,
+                                'done': chunk.get('done', False)
+                            }
+                    break
+                except Exception as e:
+                    logger.warning(f"Follow-up with {model} failed: {e}")
+                    if i == len(models) - 1:
+                        yield {
+                            'task_type': task_type.value,
+                            'chunk': f"\n\n⚠️ Failed to continue: {str(e)}\n",
+                            'model': 'error',
+                            'done': True,
+                            'error': True
+                        }
                     continue

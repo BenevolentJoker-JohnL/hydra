@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
 from typing import Dict, List, Any, Optional
 from enum import Enum
 from dataclasses import dataclass
 from loguru import logger
 import yaml
 from .json_pipeline import JSONPipeline, CodeResponseSchema, AnalysisResponseSchema
+from .config_loader import load_model_config
+from .reasoning_engine import ReasoningEngine, ReasoningMode, ThinkingStyle, ReasoningConfig
 
 class TaskComplexity(Enum):
     SIMPLE = "simple"
@@ -24,11 +27,51 @@ class OrchestrationTask:
 class ModelOrchestrator:
     def __init__(self, load_balancer, config_path: str = "config/models.yaml"):
         self.lb = load_balancer
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+        # Load config with environment variable overrides
+        self.config = load_model_config(config_path)
         self.light_model = self.config['orchestrators']['light']['model']
         self.heavy_model = self.config['orchestrators']['heavy']['model']
         self.json_pipeline = JSONPipeline(load_balancer)
+
+        # Initialize reasoning engine with config from environment
+        reasoning_config = self._load_reasoning_config()
+        self.reasoning_engine = ReasoningEngine(load_balancer, reasoning_config)
+
+        logger.info(f"🤖 ModelOrchestrator initialized: light={self.light_model}, heavy={self.heavy_model}")
+        logger.info(f"🧠 Reasoning mode: {reasoning_config.mode.value}, style: {reasoning_config.thinking_style.value}")
+
+    def _load_reasoning_config(self) -> ReasoningConfig:
+        """Load reasoning configuration from environment variables"""
+        mode_str = os.getenv('HYDRA_REASONING_MODE', 'auto').lower()
+        style_str = os.getenv('HYDRA_THINKING_STYLE', 'cot').lower()
+
+        # Map strings to enums
+        mode_map = {
+            'fast': ReasoningMode.FAST,
+            'standard': ReasoningMode.STANDARD,
+            'extended': ReasoningMode.EXTENDED,
+            'deep': ReasoningMode.DEEP_THINKING,
+            'auto': ReasoningMode.AUTO
+        }
+        style_map = {
+            'cot': ThinkingStyle.CHAIN_OF_THOUGHT,
+            'tot': ThinkingStyle.TREE_OF_THOUGHT,
+            'critique': ThinkingStyle.SELF_CRITIQUE,
+            'refine': ThinkingStyle.ITERATIVE_REFINEMENT
+        }
+
+        return ReasoningConfig(
+            mode=mode_map.get(mode_str, ReasoningMode.AUTO),
+            thinking_style=style_map.get(style_str, ThinkingStyle.CHAIN_OF_THOUGHT),
+            max_thinking_tokens=int(os.getenv('HYDRA_MAX_THINKING_TOKENS', '8000')),
+            max_critique_iterations=int(os.getenv('HYDRA_MAX_CRITIQUE_ITERATIONS', '2')),
+            use_reasoning_model=os.getenv('HYDRA_USE_REASONING_MODEL', 'true').lower() == 'true',
+            show_thinking=os.getenv('HYDRA_SHOW_THINKING', 'true').lower() == 'true',
+            # Deep thinking parameters
+            deep_thinking_tokens=int(os.getenv('HYDRA_DEEP_THINKING_TOKENS', '32000')),
+            deep_thinking_iterations=int(os.getenv('HYDRA_DEEP_THINKING_ITERATIONS', '3')),
+            deep_thinking_threshold=float(os.getenv('HYDRA_DEEP_THINKING_THRESHOLD', '8.0'))
+        )
         
     async def analyze_task(self, prompt: str, context: Dict = None) -> TaskComplexity:
         analysis_prompt = f"""Analyze this task complexity. Respond with only: SIMPLE, MODERATE, or COMPLEX
@@ -290,6 +333,71 @@ Provide a unified, high-quality response that combines the best aspects of all r
         
         return response['response']
     
+    async def orchestrate_with_reasoning(
+        self,
+        prompt: str,
+        context: Dict = None,
+        mode: Optional[ReasoningMode] = None
+    ) -> Dict:
+        """
+        Orchestrate task with Claude-style reasoning.
+
+        Args:
+            prompt: The task prompt
+            context: Optional context dictionary
+            mode: Override reasoning mode (FAST, STANDARD, EXTENDED, AUTO)
+
+        Returns:
+            Dict with 'response', 'thinking', 'mode_used', 'model_used', etc.
+        """
+        logger.info(f"🧠 Orchestrating with reasoning: {prompt[:60]}...")
+
+        # Use reasoning engine
+        result = await self.reasoning_engine.reason(
+            task=prompt,
+            context=context,
+            mode=mode
+        )
+
+        return result
+
+    async def orchestrate_reasoning_stream(
+        self,
+        prompt: str,
+        context: Dict = None,
+        mode: Optional[ReasoningMode] = None
+    ):
+        """
+        Stream orchestrated response with reasoning/thinking process.
+
+        Yields chunks with:
+        - 'chunk': text content
+        - 'type': 'thinking' | 'response' | 'metadata'
+        - 'done': boolean
+        """
+        logger.info(f"🧠 Streaming with reasoning: {prompt[:60]}...")
+
+        async for chunk in self.reasoning_engine.reason_stream(
+            task=prompt,
+            context=context,
+            mode=mode
+        ):
+            yield chunk
+
+    def set_reasoning_mode(self, mode: ReasoningMode):
+        """Change reasoning mode at runtime"""
+        self.reasoning_engine.config.mode = mode
+        logger.info(f"🎯 Reasoning mode changed to: {mode.value}")
+
+    def set_thinking_style(self, style: ThinkingStyle):
+        """Change thinking style at runtime"""
+        self.reasoning_engine.config.thinking_style = style
+        logger.info(f"🎨 Thinking style changed to: {style.value}")
+
+    def update_reasoning_config(self, **kwargs):
+        """Update reasoning configuration parameters"""
+        self.reasoning_engine.update_config(**kwargs)
+
     async def orchestrate_json(self, prompt: str, context: Dict = None) -> Dict:
         """Orchestrate task and return standardized JSON output"""
         task = OrchestrationTask(
@@ -298,9 +406,9 @@ Provide a unified, high-quality response that combines the best aspects of all r
             complexity=await self.analyze_task(prompt, context),
             context=context or {}
         )
-        
+
         logger.info(f"🧠 Orchestrating with JSON output - complexity: {task.complexity.value}")
-        
+
         # Get response based on complexity
         if task.complexity == TaskComplexity.SIMPLE:
             models = await self.route_to_models({"model_type": "general"})
@@ -313,11 +421,11 @@ Provide a unified, high-quality response that combines the best aspects of all r
             # Complex task - decompose and synthesize
             subtasks = await self.decompose_task(task)
             results = []
-            
+
             for subtask in subtasks:
                 models = await self.route_to_models(subtask)
                 subtask_results = []
-                
+
                 for model in models:
                     try:
                         response = await self.lb.generate(
@@ -330,26 +438,26 @@ Provide a unified, high-quality response that combines the best aspects of all r
                         })
                     except Exception as e:
                         logger.error(f"Model {model} failed: {e}")
-                        
+
                 results.append({
                     "subtask": subtask['subtask'],
                     "results": subtask_results
                 })
-            
+
             raw_response = await self.synthesize_results(results, task)
-        
+
         # Process through JSON pipeline
         json_result = await self.json_pipeline.process(
             response=raw_response,
             prompt=prompt,
             context=context
         )
-        
+
         # Add orchestration metadata
         json_result['orchestration'] = {
             'task_id': task.id,
             'complexity': task.complexity.value,
             'subtasks_count': len(task.dependencies) if task.dependencies else 0
         }
-        
+
         return json_result

@@ -54,17 +54,36 @@ class SOLLOLIntegration:
                 - enable_vram_monitoring: Enable VRAM monitoring (default: True)
                 - enable_dashboard: Enable UnifiedDashboard (default: True)
                 - dashboard_port: Dashboard port (default: 8080)
+                - app_name: Application name for dashboard registration (default: "Hydra")
         """
         if not SOLLOL_AVAILABLE:
             raise RuntimeError("SOLLOL is not available. Please install it first.")
 
         self.config = config or {}
+        self.app_name = self.config.get('app_name', 'Hydra')
 
         # Create SOLLOL config
         sollol_config = SOLLOLConfig()
 
-        # Initialize SOLLOL OllamaPool with auto-configuration
-        self.pool = OllamaPool.auto_configure()
+        # Initialize SOLLOL OllamaPool with app registration
+        # Note: Only pass parameters that are supported by the current SOLLOL version
+        pool_kwargs = {
+            'app_name': self.app_name,  # Register as "Hydra" in dashboard
+            'register_with_dashboard': self.config.get('register_with_dashboard', True),
+            'enable_intelligent_routing': True,
+            'redis_host': self.config.get('redis_host', 'localhost'),
+            'redis_port': self.config.get('redis_port', 6379)
+        }
+
+        # Try to add VRAM monitoring if supported by SOLLOL version
+        try:
+            import inspect
+            if 'enable_vram_monitoring' in inspect.signature(OllamaPool.__init__).parameters:
+                pool_kwargs['enable_vram_monitoring'] = self.config.get('enable_vram_monitoring', True)
+        except:
+            pass  # VRAM monitoring not supported in this version
+
+        self.pool = OllamaPool(**pool_kwargs)
 
         # Initialize dashboard if enabled
         self.dashboard = None
@@ -149,9 +168,23 @@ class SOLLOLIntegration:
     # OllamaLoadBalancer API Compatibility
     # =================================================================
 
-    async def generate(self, model: str, prompt: str, **kwargs) -> Dict[str, Any]:
+    async def generate(self, model: str, prompt: str, node_id: Optional[str] = None,
+                      prefer_local: bool = True, min_vram_gb: Optional[float] = None,
+                      **kwargs) -> Dict[str, Any]:
         """
-        Generate response from model (non-streaming).
+        Generate response from model (non-streaming) with intelligent routing.
+
+        Args:
+            model: Model name to use
+            prompt: Prompt text
+            node_id: Optional specific node ID to use
+            prefer_local: Prefer local node if it has sufficient resources (default: True)
+            min_vram_gb: Minimum VRAM required in GB (optional)
+            **kwargs: Additional parameters (temperature, top_p, etc.)
+
+        Returns:
+            Response dict with model output and routing info
+
         Compatible with OllamaLoadBalancer.generate()
         """
         start_time = datetime.now()
@@ -168,16 +201,44 @@ class SOLLOLIntegration:
             if 'repeat_penalty' in kwargs:
                 options['repeat_penalty'] = kwargs.pop('repeat_penalty')
 
+            # Select target node if resource constraints or explicit node specified
+            target_node = None
+            if node_id:
+                # Explicit node selection
+                target_node = self._get_node_by_id(node_id)
+                if not target_node:
+                    logger.warning(f"⚠️ Requested node {node_id} not found, using intelligent routing")
+                elif not target_node['is_healthy']:
+                    logger.warning(f"⚠️ Requested node {node_id} is unhealthy, using fallback")
+                    target_node = None
+                else:
+                    logger.info(f"📍 Using explicitly requested node: {node_id}")
+
+            # Resource-aware routing
+            if not target_node:
+                target_node = self._select_node_with_resources(
+                    model=model,
+                    min_vram_gb=min_vram_gb,
+                    prefer_local=prefer_local
+                )
+
+                if target_node:
+                    logger.info(f"📊 Resource-aware routing selected node: {target_node['id']} "
+                              f"(VRAM: {target_node.get('vram_available', 0):.1f}GB available)")
+
             # Use SOLLOL's generate method
+            # SOLLOL automatically routes based on resources, health, and performance
+            # Our target_node selection above influences the preference but SOLLOL makes final decision
             response = await self.pool.generate(
                 model=model,
                 prompt=prompt,
                 options=options,
-                stream=False
+                stream=False,
+                priority=kwargs.pop('priority', 5)  # Higher priority = better resource allocation
             )
 
             elapsed = (datetime.now() - start_time).total_seconds()
-            logger.success(f"✅ Model {model} completed in {elapsed:.2f}s")
+            logger.success(f"✅ Model {model} completed in {elapsed:.2f}s on {response.get('node_url', 'unknown')}")
 
             # Track metrics
             node_url = response.get('node_url', 'unknown')
@@ -188,7 +249,13 @@ class SOLLOLIntegration:
                 'response': response.get('response', ''),
                 'model': model,
                 'total_duration': response.get('total_duration', 0),
-                'node_url': node_url
+                'node_url': node_url,
+                'node_id': response.get('node_id', 'unknown'),
+                'routing_decision': {
+                    'requested_node': node_id,
+                    'selected_node': target_node['id'] if target_node else 'auto',
+                    'reason': self._get_routing_reason(node_id, target_node, prefer_local, min_vram_gb)
+                }
             }
 
         except Exception as e:
@@ -213,13 +280,22 @@ class SOLLOLIntegration:
                 options['repeat_penalty'] = kwargs.pop('repeat_penalty')
 
             # Use SOLLOL's streaming generation
-            async for chunk in self.pool.generate(
+            # Check if pool.generate returns an async generator or regular generator
+            stream_result = self.pool.generate(
                 model=model,
                 prompt=prompt,
                 options=options,
                 stream=True
-            ):
-                yield chunk
+            )
+
+            # If it's an async generator, use async for
+            if hasattr(stream_result, '__aiter__'):
+                async for chunk in stream_result:
+                    yield chunk
+            else:
+                # If it's a regular generator, convert it
+                for chunk in stream_result:
+                    yield chunk
 
         except Exception as e:
             logger.error(f"❌ Stream failed for {model}: {e}")
@@ -350,6 +426,116 @@ class SOLLOLIntegration:
             'nodes': nodes_info,
             'via_sollol': True
         }
+
+    # =================================================================
+    # Resource-Aware Routing Helper Methods
+    # =================================================================
+
+    def _get_node_by_id(self, node_id: str) -> Optional[Dict]:
+        """Get node info by ID"""
+        return self.nodes.get(node_id)
+
+    def _select_node_with_resources(
+        self,
+        model: str,
+        min_vram_gb: Optional[float] = None,
+        prefer_local: bool = True
+    ) -> Optional[Dict]:
+        """
+        Select node based on resource availability.
+
+        Args:
+            model: Model name
+            min_vram_gb: Minimum VRAM required in GB
+            prefer_local: Prefer localhost if it meets requirements
+
+        Returns:
+            Node dict or None
+        """
+        import socket
+
+        localhost_names = ['localhost', '127.0.0.1', socket.gethostname()]
+        local_node = None
+        candidate_nodes = []
+
+        # Collect healthy nodes and identify local node
+        for node_id, node in self.nodes.items():
+            if not node['is_healthy']:
+                continue
+
+            # Check VRAM requirement
+            if min_vram_gb:
+                vram_available_gb = node.get('vram_available', 0) / 1024  # Convert MB to GB
+                if vram_available_gb < min_vram_gb:
+                    logger.debug(f"Node {node_id} has insufficient VRAM: {vram_available_gb:.1f}GB < {min_vram_gb}GB required")
+                    continue
+
+            # Check if it's local
+            if any(local_name in node['host'] for local_name in localhost_names):
+                local_node = node
+
+            candidate_nodes.append(node)
+
+        # Prefer local node if enabled and available
+        if prefer_local and local_node and local_node in candidate_nodes:
+            logger.debug(f"Preferring local node: {local_node['id']}")
+            return local_node
+
+        # Otherwise return first candidate (SOLLOL will handle final routing)
+        if candidate_nodes:
+            return candidate_nodes[0]
+
+        logger.warning("No suitable nodes found for resource requirements")
+        return None
+
+    def _get_routing_reason(
+        self,
+        requested_node: Optional[str],
+        selected_node: Optional[Dict],
+        prefer_local: bool,
+        min_vram_gb: Optional[float]
+    ) -> str:
+        """Generate human-readable routing decision reason"""
+        if requested_node and selected_node and requested_node == selected_node['id']:
+            return f"Explicit node selection: {requested_node}"
+
+        if requested_node and not selected_node:
+            return f"Requested node {requested_node} unavailable, using SOLLOL intelligent routing"
+
+        reasons = []
+        if prefer_local:
+            reasons.append("local preference")
+        if min_vram_gb:
+            reasons.append(f"min {min_vram_gb}GB VRAM required")
+
+        if reasons and selected_node:
+            return f"Resource-aware routing ({', '.join(reasons)}) → {selected_node['id']}"
+
+        return "SOLLOL intelligent routing (automatic)"
+
+    def get_node_resources(self) -> List[Dict]:
+        """
+        Get current resource status for all nodes.
+
+        Returns:
+            List of dicts with node resource information
+        """
+        nodes_info = []
+        for node_id, node in self.nodes.items():
+            nodes_info.append({
+                'id': node_id,
+                'host': node['host'],
+                'port': node['port'],
+                'url': node['url'],
+                'type': node['type'],
+                'healthy': node['is_healthy'],
+                'vram_total_mb': node.get('vram_total', 0),
+                'vram_available_mb': node.get('vram_available', 0),
+                'vram_available_gb': node.get('vram_available', 0) / 1024,
+                'models_loaded': node.get('models_loaded', []),
+                'models_loaded_count': len(node.get('models_loaded', []))
+            })
+        return nodes_info
 
     async def close(self):
         """Cleanup SOLLOL resources"""

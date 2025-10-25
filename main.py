@@ -22,7 +22,18 @@ from db.connections import db_manager
 from core.memory import HierarchicalMemory
 from core.orchestrator import ModelOrchestrator
 from core.sollol_integration import SOLLOLIntegration
-from workflows.dag_pipeline import code_generation_pipeline
+
+# Try to import workflow pipeline, but make it optional
+WORKFLOW_AVAILABLE = False
+code_generation_pipeline = None
+try:
+    from workflows.dag_pipeline import code_generation_pipeline
+    WORKFLOW_AVAILABLE = True
+    logger.info("Workflow pipeline loaded successfully")
+except Exception as e:
+    logger.info(f"Workflow pipeline not available (optional): {e}")
+    # This is expected and OK - workflow is optional
+    pass
 
 # Legacy imports kept for backward compatibility if needed
 # from core.distributed import DistributedManager
@@ -49,18 +60,22 @@ async def lifespan(app: FastAPI):
 
     # Initialize SOLLOL with configuration from environment variables
     sollol_config = {
+        'app_name': os.getenv('HYDRA_APP_NAME', 'Hydra-API'),
+        'register_with_dashboard': os.getenv('SOLLOL_REGISTER_APP', 'true').lower() == 'true',
         'discovery_enabled': os.getenv('SOLLOL_DISCOVERY_ENABLED', 'true').lower() == 'true',
         'discovery_timeout': int(os.getenv('SOLLOL_DISCOVERY_TIMEOUT', '10')),
         'health_check_interval': int(os.getenv('SOLLOL_HEALTH_CHECK_INTERVAL', '120')),
         'enable_vram_monitoring': os.getenv('SOLLOL_VRAM_MONITORING', 'true').lower() == 'true',
         'enable_dashboard': os.getenv('SOLLOL_DASHBOARD_ENABLED', 'true').lower() == 'true',
         'dashboard_port': int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080')),
+        'redis_host': os.getenv('REDIS_HOST', 'localhost'),
+        'redis_port': int(os.getenv('REDIS_PORT', '6379')),
         'log_level': os.getenv('SOLLOL_LOG_LEVEL', 'INFO').upper()
     }
 
-    logger.info(f"SOLLOL Configuration: discovery={sollol_config['discovery_enabled']}, "
+    logger.info(f"SOLLOL Configuration: app={sollol_config['app_name']}, discovery={sollol_config['discovery_enabled']}, "
                 f"dashboard={'enabled' if sollol_config['enable_dashboard'] else 'disabled'} "
-                f"(port {sollol_config['dashboard_port']})")
+                f"(port {sollol_config['dashboard_port']}), register={sollol_config['register_with_dashboard']}")
 
     # Create SOLLOL integration (replaces both OllamaLoadBalancer and DistributedManager)
     sollol = SOLLOLIntegration(config=sollol_config)
@@ -133,22 +148,31 @@ async def generate_code(request: CodeRequest):
         if cached:
             logger.info("Returning cached response")
             return cached
-            
-        result = await code_generation_pipeline({
-            "prompt": request.prompt,
-            "context": request.context or {},
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens
-        })
-        
+
+        # Use workflow pipeline if available, otherwise fallback to orchestrator
+        if WORKFLOW_AVAILABLE and code_generation_pipeline:
+            result = await code_generation_pipeline({
+                "prompt": request.prompt,
+                "context": request.context or {},
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens
+            })
+        else:
+            # Fallback to direct orchestrator call
+            logger.info("Using orchestrator fallback (workflow not available)")
+            result = await orchestrator.orchestrate(
+                prompt=request.prompt,
+                context=request.context
+            )
+
         await memory.store(
             key=request.prompt,
             content=result,
             metadata={"models": request.models} if request.models else {}
         )
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"Generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

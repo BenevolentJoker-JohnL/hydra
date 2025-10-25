@@ -18,9 +18,22 @@ nest_asyncio.apply()
 configure_logging(verbose=True)
 
 from core.orchestrator import ModelOrchestrator
-from models.ollama_manager import OllamaLoadBalancer, ModelPool
+from core.sollol_integration import SOLLOLIntegration
 from core.code_assistant import CodeAssistant, StreamingCodeAssistant, TaskDetector
-from workflows.dag_pipeline import code_generation_pipeline
+import os
+
+# Try to import workflow pipeline, but make it optional
+WORKFLOW_AVAILABLE = False
+code_generation_pipeline = None
+try:
+    from workflows.dag_pipeline import code_generation_pipeline
+    WORKFLOW_AVAILABLE = True
+    logger.info("Workflow pipeline loaded successfully")
+except Exception as e:
+    logger.info(f"Workflow pipeline not available (optional): {e}")
+    # This is expected and OK - workflow is optional
+    pass
+
 from db.connections import db_manager
 from core.memory import HierarchicalMemory
 from ui.enhanced_project_manager import EnhancedProjectManager, render_enhanced_project_sidebar, render_project_files_panel
@@ -28,6 +41,7 @@ from ui.project_context import get_project_context
 from ui.artifacts import ArtifactManager, ArtifactGenerator, render_artifact_panel, render_artifacts_sidebar, extract_artifacts_from_response
 from ui.file_handler import FileHandler, render_file_upload_zone, create_file_reference, parse_file_references, render_file_in_chat, FileSearch
 from ui.terminal import Terminal, GenerationLogger, render_terminal_panel
+from ui.approval_handler import ApprovalHandler, render_approval_stats, setup_auto_approval_rules
 from core.tools import ToolRegistry, ToolEnhancedGenerator
 import yaml
 
@@ -50,50 +64,75 @@ if 'enhanced_project_manager' not in st.session_state:
 
 @st.cache_resource
 def initialize_system():
-    with open('config/models.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-    
-    hosts = [
-        "http://localhost:11434",
-        "http://192.168.1.100:11434",
-        "http://192.168.1.101:11434",
-        "http://192.168.1.102:11434"
-    ]
-    
-    try:
-        lb = OllamaLoadBalancer([h for h in hosts if h])
-        
-        # Test connection without blocking
-        # We'll check health asynchronously later when actually needed
-        import httpx
-        try:
-            # Quick synchronous check if Ollama is reachable
-            with httpx.Client(timeout=2.0) as client:
-                response = client.get(f"{hosts[0]}/api/tags")
-                if response.status_code == 200:
-                    logger.info("✅ Ollama connection verified")
-                else:
-                    logger.warning(f"Ollama returned status {response.status_code}")
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
-            logger.warning(f"⚠️ Ollama may not be running: {e}")
-            # Don't fail completely, continue with setup
-        
-        orchestrator = ModelOrchestrator(lb)
-        pool = ModelPool(lb, config)
-        code_assistant = StreamingCodeAssistant(lb)
-        return lb, orchestrator, pool, config, code_assistant
-        
-    except Exception as e:
-        logger.warning(f"Failed to initialize Ollama components: {e}")
-        # Return None for load balancer but still create other objects
-        orchestrator = None
-        pool = None
-        code_assistant = StreamingCodeAssistant(None)
-        return None, orchestrator, pool, config, code_assistant
+    """Initialize Hydra system with SOLLOL integration"""
+    from core.config_loader import load_model_config
 
-async def process_code_request_stream(prompt: str, context: Dict = None):
+    # Load config with environment variable overrides
+    config = load_model_config()
+
+    # Initialize SOLLOL with configuration from environment variables
+    sollol_config = {
+        'app_name': os.getenv('HYDRA_APP_NAME', 'Hydra-UI'),
+        'register_with_dashboard': os.getenv('SOLLOL_REGISTER_APP', 'true').lower() == 'true',
+        'discovery_enabled': os.getenv('SOLLOL_DISCOVERY_ENABLED', 'true').lower() == 'true',
+        'discovery_timeout': int(os.getenv('SOLLOL_DISCOVERY_TIMEOUT', '10')),
+        'health_check_interval': int(os.getenv('SOLLOL_HEALTH_CHECK_INTERVAL', '120')),
+        'enable_vram_monitoring': os.getenv('SOLLOL_VRAM_MONITORING', 'true').lower() == 'true',
+        'enable_dashboard': os.getenv('SOLLOL_DASHBOARD_ENABLED', 'true').lower() == 'true',
+        'dashboard_port': int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080')),
+        'redis_host': os.getenv('REDIS_HOST', 'localhost'),
+        'redis_port': int(os.getenv('REDIS_PORT', '6379')),
+        'log_level': os.getenv('SOLLOL_LOG_LEVEL', 'INFO').upper()
+    }
+
+    logger.info(f"🚀 Initializing Hydra with SOLLOL...")
+    logger.info(f"   App Name: {sollol_config['app_name']}")
+    logger.info(f"   Register with Dashboard: {sollol_config['register_with_dashboard']}")
+    logger.info(f"   Discovery: {sollol_config['discovery_enabled']}")
+    logger.info(f"   VRAM Monitoring: {sollol_config['enable_vram_monitoring']}")
+    logger.info(f"   Dashboard: {'enabled' if sollol_config['enable_dashboard'] else 'disabled'} (port {sollol_config['dashboard_port']})")
+
+    try:
+        # Create SOLLOL integration (replaces OllamaLoadBalancer)
+        sollol = SOLLOLIntegration(config=sollol_config)
+
+        # Initialize SOLLOL (synchronously for Streamlit)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(sollol.initialize())
+
+        logger.info(f"✅ SOLLOL initialized successfully")
+        logger.info(f"📊 Discovered {len(sollol.hosts)} Ollama nodes")
+
+        if sollol.dashboard_enabled and sollol.dashboard:
+            logger.info(f"🎨 SOLLOL Dashboard: http://localhost:{sollol.dashboard_port}")
+
+        # Initialize orchestrator with SOLLOL
+        orchestrator = ModelOrchestrator(sollol)
+        code_assistant = StreamingCodeAssistant(sollol)
+
+        # Setup approval handler and auto-approval rules
+        setup_auto_approval_rules(code_assistant.approval_tracker)
+        logger.info("✅ Approval system initialized with default rules")
+
+        return sollol, orchestrator, config, code_assistant
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize SOLLOL: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return None for sollol but still create other objects
+        orchestrator = None
+        code_assistant = StreamingCodeAssistant(None)
+
+        # Setup approval handler even on error
+        setup_auto_approval_rules(code_assistant.approval_tracker)
+
+        return None, orchestrator, config, code_assistant
+
+async def process_code_request_stream(prompt: str, context: Dict = None, use_tools: bool = False):
     """Process code request with streaming response using Code Assistant"""
-    lb, orchestrator, pool, config, code_assistant = initialize_system()
+    sollol, orchestrator, config, code_assistant = initialize_system()
     
     # Initialize terminal logger
     if 'terminal' not in st.session_state:
@@ -124,8 +163,8 @@ async def process_code_request_stream(prompt: str, context: Dict = None):
     logger.log_orchestration("Task detected", f"Type: {task_type.value}")
     
     # Check if we have a connection
-    if not lb:
-        st.error("⚠️ Ollama is not connected. Please ensure Ollama is running.")
+    if not sollol:
+        st.error("⚠️ SOLLOL is not initialized. Please ensure Ollama is running.")
         st.info("You can download Ollama from: https://ollama.com/download")
         st.code("# After installing, run:\ncurl -fsSL https://ollama.com/install.sh | sh\nsudo systemctl start ollama", language="bash")
         return {'response': 'Ollama connection required', 'error': True}
@@ -134,13 +173,13 @@ async def process_code_request_stream(prompt: str, context: Dict = None):
     try:
         # Stream the response
         logger.log_orchestration(f"Starting {task_type.value} task")
-        
-        async for chunk_data in code_assistant.process_stream(prompt, context):
+
+        async for chunk_data in code_assistant.process_stream(prompt, context, use_tools=use_tools):
             if 'chunk' in chunk_data:
                 full_response += chunk_data['chunk']
                 # Update the placeholder with streaming content
                 response_placeholder.markdown(full_response)
-                
+
                 # Log streaming progress
                 if chunk_data.get('done', False):
                     logger.log_success(f"{task_type.value.title()} completed")
@@ -168,7 +207,7 @@ async def process_code_request_stream(prompt: str, context: Dict = None):
 
 async def process_code_request(prompt: str, context: Dict = None):
     """Legacy non-streaming version for compatibility"""
-    lb, orchestrator, pool, config, code_assistant = initialize_system()
+    sollol, orchestrator, config, code_assistant = initialize_system()
     
     # Initialize terminal logger
     if 'terminal' not in st.session_state:
@@ -260,10 +299,24 @@ def main():
         settings_panel()
 
 def chat_interface():
+    # Initialize approval handler
+    if 'approval_handler' not in st.session_state:
+        st.session_state.approval_handler = ApprovalHandler()
+    approval_handler = st.session_state.approval_handler
+
+    # Setup approval callback for code_assistant if available
+    if 'code_assistant' in st.session_state:
+        st.session_state.code_assistant.tool_caller.set_approval_callback(
+            approval_handler.request_approval
+        )
+
     # Create columns for chat and artifacts
     col_chat, col_artifact = st.columns([1, 1])
-    
+
     with col_chat:
+        # Render pending approval requests
+        approval_handler.render_pending_approvals()
+
         # Chat history container
         chat_container = st.container()
         
@@ -386,19 +439,22 @@ def chat_interface():
                                 st.caption(f"📎 {file_info['name']}: {file_info['size'] / 1024:.1f} KB (binary)")
         
         # Input area with enhanced features
-        col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
-        
+        col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+
         with col1:
             prompt = st.chat_input("Enter your coding request...")
-        
+
         with col2:
-            use_context = st.checkbox("Context", value=True)
-        
+            use_context = st.checkbox("Context", value=True, help="Include project context")
+
         with col3:
-            use_tools = st.checkbox("Tools", value=True)
-            
+            use_tools = st.checkbox("Tools", value=True, help="Enable tool usage")
+
         with col4:
-            create_artifact = st.checkbox("Artifact", value=True)
+            use_reasoning = st.checkbox("🧠 Reasoning", value=False, help="Use Claude-style reasoning (slower, higher quality)")
+
+        with col5:
+            create_artifact = st.checkbox("Artifact", value=True, help="Create artifacts")
     
     if prompt:
         # Parse file references in prompt
@@ -459,7 +515,7 @@ def chat_interface():
         with st.chat_message("assistant"):
             async def run_generation_stream():
                 context = get_project_context() if use_context else None
-                
+
                 # Add referenced files to context
                 if referenced_files and context:
                     context['referenced_files'] = {}
@@ -468,13 +524,33 @@ def chat_interface():
                             file_obj = project.files[file_path]
                             if not file_obj.is_binary and file_obj.content:
                                 context['referenced_files'][file_path] = file_obj.content
-                
+
                 # Add attached files to context
                 if attached_files_info and context:
                     context['attached_files'] = attached_files_info
-                
-                # Use streaming version
-                result = await process_code_request_stream(prompt, context)
+
+                # Use reasoning mode if enabled
+                if use_reasoning:
+                    _, orchestrator, _, _ = initialize_system()
+                    if orchestrator:
+                        # Use reasoning engine for higher quality
+                        response_placeholder = st.empty()
+                        thinking_placeholder = st.empty()
+                        full_response = ""
+                        thinking_content = ""
+
+                        async for chunk in orchestrator.orchestrate_reasoning_stream(prompt, context):
+                            if chunk.get('type') == 'thinking':
+                                thinking_content += chunk['chunk']
+                                thinking_placeholder.expander("🤔 Thinking", expanded=False).markdown(thinking_content)
+                            elif chunk.get('type') == 'response':
+                                full_response += chunk['chunk']
+                                response_placeholder.markdown(full_response)
+
+                        return {'response': full_response, 'thinking': thinking_content}
+
+                # Use standard streaming version
+                result = await process_code_request_stream(prompt, context, use_tools=use_tools)
                 return result
             
             # Use streaming for better UX (with async helper)
@@ -604,7 +680,7 @@ def dashboard():
                         65, 70, 68, 65, 60, 55, 48, 40, 35, 30, 25, 20]
         })
         fig = px.line(requests, x='Time', y='Requests', title='Requests over Last 24 Hours')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     
     with col2:
         st.subheader("Model Performance")
@@ -614,7 +690,7 @@ def dashboard():
             'Avg Tokens/s': [45, 38, 42, 35, 40]
         })
         fig = px.bar(model_data, x='Model', y='Success Rate', title='Model Success Rates (%)')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     
     # System Health
     st.subheader("System Health")
@@ -647,7 +723,7 @@ def workflow_management():
             "ETA": ["5 min", "12 min", "Waiting"]
         })
         
-        st.dataframe(workflows_df, use_container_width=True)
+        st.dataframe(workflows_df, width='stretch')
         
         # Progress bars
         for _, row in workflows_df.iterrows():
@@ -763,12 +839,12 @@ def memory_explorer():
         
         fig = px.line(cache_data, x='Date', y=['Hit Rate', 'Miss Rate'],
                      title='Cache Performance Over Time')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 def settings_panel():
     st.header("⚙️ Settings")
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["Models", "Database", "API", "Export"])
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Models", "Database", "API", "Export", "Reasoning", "🔐 Tool Approvals"])
     
     with tab1:
         st.subheader("Model Configuration")
@@ -821,13 +897,13 @@ def settings_panel():
     
     with tab4:
         st.subheader("Export & Backup")
-        
+
         st.write("Export Options")
-        
+
         include_chat = st.checkbox("Include chat history", value=True)
         include_projects = st.checkbox("Include projects", value=True)
         include_memory = st.checkbox("Include memory cache", value=False)
-        
+
         if st.button("Generate Export"):
             with st.spinner("Creating export..."):
                 # Mock export
@@ -838,6 +914,293 @@ def settings_panel():
                     "hydra_export.zip",
                     "application/zip"
                 )
+
+    with tab5:
+        st.subheader("🧠 Reasoning Engine")
+
+        st.markdown("""
+        Configure Claude-style reasoning for local models. The reasoning engine adds
+        structured thinking and self-critique capabilities to improve response quality.
+        """)
+
+        # Initialize orchestrator to access reasoning settings
+        _, orchestrator, _, _ = initialize_system()
+
+        if orchestrator is None:
+            st.error("Orchestrator not initialized. Please check SOLLOL connection.")
+            return
+
+        # Current settings display
+        current_mode = os.getenv('HYDRA_REASONING_MODE', 'auto')
+        current_style = os.getenv('HYDRA_THINKING_STYLE', 'cot')
+        current_thinking_tokens = int(os.getenv('HYDRA_MAX_THINKING_TOKENS', '8000'))
+        current_critique_iterations = int(os.getenv('HYDRA_MAX_CRITIQUE_ITERATIONS', '2'))
+        use_reasoning_model = os.getenv('HYDRA_USE_REASONING_MODEL', 'true').lower() == 'true'
+        show_thinking = os.getenv('HYDRA_SHOW_THINKING', 'true').lower() == 'true'
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("### Reasoning Mode")
+            reasoning_mode = st.selectbox(
+                "Mode",
+                options=["auto", "fast", "standard", "extended", "deep"],
+                index=["auto", "fast", "standard", "extended", "deep"].index(current_mode) if current_mode in ["auto", "fast", "standard", "extended", "deep"] else 0,
+                help="""
+                - **Auto**: Automatically select based on task complexity
+                - **Fast**: Direct response, no thinking (~1-2s)
+                - **Standard**: Chain-of-thought reasoning (~3-5s)
+                - **Extended**: Deep reasoning with QwQ (~10-30s)
+                - **Deep**: Maximum thinking budget, multi-pass critique (~30-60s+)
+                """
+            )
+
+            thinking_style = st.selectbox(
+                "Thinking Style",
+                options=["cot", "tot", "critique", "refine"],
+                index=["cot", "tot", "critique", "refine"].index(current_style),
+                help="""
+                - **CoT**: Chain of Thought - step-by-step reasoning
+                - **ToT**: Tree of Thought - explore multiple paths
+                - **Critique**: Self-critique and improve
+                - **Refine**: Iterative refinement
+                """
+            )
+
+            max_thinking_tokens = st.slider(
+                "Max Thinking Tokens",
+                min_value=1000,
+                max_value=16000,
+                value=current_thinking_tokens,
+                step=1000,
+                help="Maximum tokens allocated for thinking/reasoning process"
+            )
+
+        with col2:
+            st.markdown("### Advanced Settings")
+
+            max_critique_iterations = st.slider(
+                "Self-Critique Iterations",
+                min_value=0,
+                max_value=5,
+                value=current_critique_iterations,
+                help="Number of self-critique and improvement loops (0-5)"
+            )
+
+            use_specialized_model = st.checkbox(
+                "Use Specialized Reasoning Model (QwQ)",
+                value=use_reasoning_model,
+                help="Use QwQ:32b for extended reasoning tasks (slower but higher quality)"
+            )
+
+            show_thinking_process = st.checkbox(
+                "Show Thinking Process",
+                value=show_thinking,
+                help="Display the model's thinking process in chat (like Claude)"
+            )
+
+        # Deep Thinking Settings
+        st.markdown("---")
+        st.markdown("### 🧠💭 Deep Thinking Mode Settings")
+        st.caption("Programmatic long think - automatically triggered for very complex tasks")
+
+        deep_thinking_tokens = int(os.getenv('HYDRA_DEEP_THINKING_TOKENS', '32000'))
+        deep_thinking_iterations = int(os.getenv('HYDRA_DEEP_THINKING_ITERATIONS', '3'))
+        deep_thinking_threshold = float(os.getenv('HYDRA_DEEP_THINKING_THRESHOLD', '8.0'))
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            deep_thinking_tokens = st.slider(
+                "Deep Thinking Token Budget",
+                min_value=8000,
+                max_value=64000,
+                value=deep_thinking_tokens,
+                step=4000,
+                help="Maximum tokens for deep thinking mode (higher = more thorough but slower)"
+            )
+
+        with col2:
+            deep_thinking_iterations = st.slider(
+                "Deep Critique Passes",
+                min_value=1,
+                max_value=5,
+                value=deep_thinking_iterations,
+                help="Number of self-critique iterations in deep thinking mode"
+            )
+
+        with col3:
+            deep_thinking_threshold = st.slider(
+                "Auto-Trigger Threshold",
+                min_value=7.0,
+                max_value=10.0,
+                value=deep_thinking_threshold,
+                step=0.5,
+                help="Complexity score (1-10) that triggers deep thinking automatically. Set to 10+ to disable."
+            )
+
+        st.info(f"💡 Deep thinking will auto-trigger when task complexity ≥ {deep_thinking_threshold:.1f}/10.0")
+
+        # Save button
+        st.markdown("---")
+        col1, col2, col3 = st.columns([2, 1, 1])
+
+        with col1:
+            if st.button("💾 Save Reasoning Settings", use_container_width=True):
+                # Update environment variables in .env file
+                from dotenv import set_key
+                env_path = '.env'
+
+                set_key(env_path, 'HYDRA_REASONING_MODE', reasoning_mode)
+                set_key(env_path, 'HYDRA_THINKING_STYLE', thinking_style)
+                set_key(env_path, 'HYDRA_MAX_THINKING_TOKENS', str(max_thinking_tokens))
+                set_key(env_path, 'HYDRA_MAX_CRITIQUE_ITERATIONS', str(max_critique_iterations))
+                set_key(env_path, 'HYDRA_USE_REASONING_MODEL', 'true' if use_specialized_model else 'false')
+                set_key(env_path, 'HYDRA_SHOW_THINKING', 'true' if show_thinking_process else 'false')
+
+                # Deep thinking parameters
+                set_key(env_path, 'HYDRA_DEEP_THINKING_TOKENS', str(deep_thinking_tokens))
+                set_key(env_path, 'HYDRA_DEEP_THINKING_ITERATIONS', str(deep_thinking_iterations))
+                set_key(env_path, 'HYDRA_DEEP_THINKING_THRESHOLD', str(deep_thinking_threshold))
+
+                st.success("✅ Settings saved! Restart the app to apply changes.")
+
+        with col2:
+            if st.button("🔄 Apply Now", use_container_width=True):
+                # Apply settings to current orchestrator session
+                from core.reasoning_engine import ReasoningMode, ThinkingStyle
+
+                mode_map = {
+                    'auto': ReasoningMode.AUTO,
+                    'fast': ReasoningMode.FAST,
+                    'standard': ReasoningMode.STANDARD,
+                    'extended': ReasoningMode.EXTENDED,
+                    'deep': ReasoningMode.DEEP_THINKING
+                }
+                style_map = {
+                    'cot': ThinkingStyle.CHAIN_OF_THOUGHT,
+                    'tot': ThinkingStyle.TREE_OF_THOUGHT,
+                    'critique': ThinkingStyle.SELF_CRITIQUE,
+                    'refine': ThinkingStyle.ITERATIVE_REFINEMENT
+                }
+
+                orchestrator.set_reasoning_mode(mode_map[reasoning_mode])
+                orchestrator.set_thinking_style(style_map[thinking_style])
+                orchestrator.update_reasoning_config(
+                    max_thinking_tokens=max_thinking_tokens,
+                    max_critique_iterations=max_critique_iterations,
+                    use_reasoning_model=use_specialized_model,
+                    show_thinking=show_thinking_process,
+                    deep_thinking_tokens=deep_thinking_tokens,
+                    deep_thinking_iterations=deep_thinking_iterations,
+                    deep_thinking_threshold=deep_thinking_threshold
+                )
+
+                st.success("✅ Applied to current session!")
+
+        with col3:
+            if st.button("↩️ Reset", use_container_width=True):
+                st.rerun()
+
+        # Information section
+        st.markdown("---")
+        st.markdown("### 📊 Reasoning Models")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.info(f"""
+            **Current Reasoning Model**
+            - Model: `qwq:32b`
+            - Optimized for: Deep reasoning, complex tasks
+            - Token budget: {max_thinking_tokens:,} tokens
+            """)
+
+        with col2:
+            st.info(f"""
+            **Performance Impact**
+            - Fast mode: ~1-2s per response
+            - Standard mode: ~3-5s per response
+            - Extended mode: ~10-30s per response
+            - **Deep mode: ~30-60s+ per response**
+
+            Deep mode uses {deep_thinking_tokens:,} tokens with {deep_thinking_iterations} critique passes.
+            """)
+
+    with tab6:
+        st.subheader("🔐 Tool Execution Approvals")
+
+        st.markdown("""
+        Configure how Hydra requests approval for tool executions.
+        **CRITICAL operations** (write_file, run_command) always require approval and cannot be bypassed.
+        """)
+
+        # Display approval statistics
+        render_approval_stats()
+
+        st.markdown("---")
+        st.markdown("### 🔒 Permission Levels")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.success("""
+            **SAFE**
+            - read_file
+            - list_directory
+            - analyze_code
+            - search_codebase
+
+            Auto-approved, no prompts.
+            """)
+
+        with col2:
+            st.warning("""
+            **REQUIRES_APPROVAL**
+            - execute_python
+
+            Needs approval, but can be auto-approved with rules.
+            """)
+
+        with col3:
+            st.error("""
+            **CRITICAL**
+            - write_file
+            - run_command
+
+            **ALWAYS** requires explicit approval. Cannot bypass.
+            """)
+
+        st.markdown("---")
+        st.markdown("### ⚡ Auto-Approval Rules")
+
+        st.info("""
+        Auto-approval rules allow frequently used operations to proceed without prompting.
+        - **Previously approved**: Same operation won't ask again
+        - **Pattern matching**: Operations matching safe patterns auto-approve
+        - **Session limits**: Prevent excessive auto-approvals
+
+        **CRITICAL operations are NEVER auto-approved.**
+        """)
+
+        if 'code_assistant' in st.session_state:
+            tracker = st.session_state.code_assistant.approval_tracker
+            stats = tracker.get_approval_stats()
+
+            st.markdown(f"**Active Rules**: {stats['auto_approval_patterns']}")
+
+            if st.button("🔄 Reset All Approvals"):
+                tracker.approved_operations.clear()
+                tracker.approval_history.clear()
+                tracker.session_approvals.clear()
+                st.success("✅ All approval history cleared!")
+                st.rerun()
+
+            if st.button("➕ Add Custom Rule"):
+                st.info("Custom rule UI coming soon! Edit `ui/approval_handler.py` to add patterns manually.")
+
+        else:
+            st.warning("Code assistant not initialized. Start a chat session to configure approvals.")
 
 def extract_code_from_response(response: str) -> Optional[str]:
     import re

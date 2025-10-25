@@ -3,10 +3,12 @@ import ast
 import subprocess
 import os
 import re
-from typing import Dict, List, Any, Optional, Callable
-from dataclasses import dataclass
+import hashlib
+from typing import Dict, List, Any, Optional, Callable, Set
+from dataclasses import dataclass, field
 from enum import Enum
 import asyncio
+from datetime import datetime, timedelta
 from loguru import logger
 
 class ToolType(Enum):
@@ -15,6 +17,12 @@ class ToolType(Enum):
     API = "api"
     FILE = "file"
 
+class PermissionLevel(Enum):
+    """Permission levels for tool execution"""
+    SAFE = "safe"                      # Auto-approved, no permission needed
+    REQUIRES_APPROVAL = "approval"      # Needs approval, can be auto-approved with rules
+    CRITICAL = "critical"               # ALWAYS needs explicit approval, cannot bypass
+
 @dataclass
 class Tool:
     name: str
@@ -22,7 +30,136 @@ class Tool:
     parameters: Dict[str, Any]
     function: Optional[Callable] = None
     type: ToolType = ToolType.FUNCTION
-    
+    permission_level: PermissionLevel = PermissionLevel.SAFE
+
+class ApprovalTracker:
+    """
+    Tracks approved operations to avoid excessive approval prompts.
+    Supports auto-approval rules and pattern matching.
+    """
+    def __init__(self):
+        self.approved_operations: Set[str] = set()  # Hashes of approved operations
+        self.auto_approve_patterns: List[Dict] = []  # Auto-approval rules
+        self.approval_history: List[Dict] = []       # History of approvals
+        self.session_approvals: Dict[str, int] = {}  # Count per tool in session
+
+    def _hash_operation(self, tool_name: str, arguments: Dict) -> str:
+        """Create a unique hash for an operation"""
+        # Normalize arguments for consistent hashing
+        normalized = json.dumps(arguments, sort_keys=True)
+        operation_str = f"{tool_name}:{normalized}"
+        return hashlib.sha256(operation_str.encode()).hexdigest()[:16]
+
+    def is_approved(self, tool_name: str, arguments: Dict, permission_level: PermissionLevel) -> bool:
+        """Check if operation is already approved or matches auto-approval rules"""
+        # CRITICAL operations NEVER auto-approve
+        if permission_level == PermissionLevel.CRITICAL:
+            return False
+
+        # SAFE operations always approved
+        if permission_level == PermissionLevel.SAFE:
+            return True
+
+        # Check if this exact operation was approved before
+        op_hash = self._hash_operation(tool_name, arguments)
+        if op_hash in self.approved_operations:
+            logger.info(f"✅ Auto-approved: {tool_name} (previously approved)")
+            return True
+
+        # Check auto-approval patterns
+        for pattern in self.auto_approve_patterns:
+            if self._matches_pattern(tool_name, arguments, pattern):
+                logger.info(f"✅ Auto-approved: {tool_name} (matches pattern: {pattern.get('name', 'unnamed')})")
+                return True
+
+        return False
+
+    def _matches_pattern(self, tool_name: str, arguments: Dict, pattern: Dict) -> bool:
+        """Check if operation matches an auto-approval pattern"""
+        # Check tool name
+        if pattern.get('tool') and pattern['tool'] != tool_name:
+            return False
+
+        # Check argument patterns
+        if 'argument_patterns' in pattern:
+            for key, regex_pattern in pattern['argument_patterns'].items():
+                if key in arguments:
+                    if not re.match(regex_pattern, str(arguments[key])):
+                        return False
+
+        # Check conditions
+        if 'conditions' in pattern:
+            for condition in pattern['conditions']:
+                if not self._check_condition(tool_name, arguments, condition):
+                    return False
+
+        return True
+
+    def _check_condition(self, tool_name: str, arguments: Dict, condition: Dict) -> bool:
+        """Check a specific condition"""
+        cond_type = condition.get('type')
+
+        if cond_type == 'path_prefix':
+            path = arguments.get('path', '')
+            allowed_prefixes = condition.get('allowed_prefixes', [])
+            return any(path.startswith(prefix) for prefix in allowed_prefixes)
+
+        elif cond_type == 'file_extension':
+            path = arguments.get('path', '')
+            allowed_extensions = condition.get('allowed_extensions', [])
+            return any(path.endswith(ext) for ext in allowed_extensions)
+
+        elif cond_type == 'max_file_size':
+            # Check if file exists and is under size limit
+            path = arguments.get('path', '')
+            max_size = condition.get('max_bytes', 1024*1024)  # 1MB default
+            if os.path.exists(path):
+                return os.path.getsize(path) <= max_size
+            return True  # If doesn't exist yet, allow
+
+        elif cond_type == 'session_limit':
+            # Check if tool hasn't been used too many times this session
+            max_uses = condition.get('max_uses', 10)
+            return self.session_approvals.get(tool_name, 0) < max_uses
+
+        return True
+
+    def record_approval(self, tool_name: str, arguments: Dict, permission_level: PermissionLevel,
+                       auto_approved: bool = False):
+        """Record an approval"""
+        op_hash = self._hash_operation(tool_name, arguments)
+        self.approved_operations.add(op_hash)
+
+        # Track session usage
+        self.session_approvals[tool_name] = self.session_approvals.get(tool_name, 0) + 1
+
+        # Add to history
+        self.approval_history.append({
+            'tool': tool_name,
+            'arguments': arguments,
+            'permission_level': permission_level.value,
+            'auto_approved': auto_approved,
+            'timestamp': datetime.now().isoformat(),
+            'hash': op_hash
+        })
+
+        logger.debug(f"📝 Recorded approval: {tool_name} (auto: {auto_approved})")
+
+    def add_auto_approval_pattern(self, pattern: Dict):
+        """Add an auto-approval pattern"""
+        self.auto_approve_patterns.append(pattern)
+        logger.info(f"➕ Added auto-approval pattern: {pattern.get('name', 'unnamed')}")
+
+    def get_approval_stats(self) -> Dict:
+        """Get statistics about approvals"""
+        return {
+            'total_approvals': len(self.approval_history),
+            'unique_operations': len(self.approved_operations),
+            'auto_approval_patterns': len(self.auto_approve_patterns),
+            'session_usage': dict(self.session_approvals),
+            'recent_approvals': self.approval_history[-10:]  # Last 10
+        }
+
 class ToolRegistry:
     def __init__(self):
         self.tools = {}
@@ -45,7 +182,7 @@ class ToolRegistry:
         ]
         
     def _register_default_tools(self):
-        # File operations
+        # File operations - READ ONLY (SAFE)
         self.register(Tool(
             name="read_file",
             description="Read contents of a file",
@@ -53,20 +190,22 @@ class ToolRegistry:
                 "path": {"type": "string", "description": "File path to read"}
             },
             function=self._read_file,
-            type=ToolType.FILE
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.SAFE  # Reading is safe
         ))
-        
+
         self.register(Tool(
             name="write_file",
-            description="Write content to a file",
+            description="Write content to a file (CRITICAL: modifies filesystem)",
             parameters={
                 "path": {"type": "string", "description": "File path to write"},
                 "content": {"type": "string", "description": "Content to write"}
             },
             function=self._write_file,
-            type=ToolType.FILE
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.CRITICAL  # Writing is critical - always needs approval
         ))
-        
+
         self.register(Tool(
             name="list_directory",
             description="List files in a directory",
@@ -74,31 +213,34 @@ class ToolRegistry:
                 "path": {"type": "string", "description": "Directory path"}
             },
             function=self._list_directory,
-            type=ToolType.FILE
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.SAFE  # Listing is safe
         ))
-        
-        # Code execution
+
+        # Code execution - REQUIRES APPROVAL
         self.register(Tool(
             name="execute_python",
-            description="Execute Python code and return output",
+            description="Execute Python code and return output (can be auto-approved with rules)",
             parameters={
                 "code": {"type": "string", "description": "Python code to execute"}
             },
             function=self._execute_python,
-            type=ToolType.FUNCTION
+            type=ToolType.FUNCTION,
+            permission_level=PermissionLevel.REQUIRES_APPROVAL  # Can be auto-approved
         ))
-        
+
         self.register(Tool(
             name="run_command",
-            description="Run a shell command",
+            description="Run a shell command (CRITICAL: can modify system)",
             parameters={
                 "command": {"type": "string", "description": "Command to run"}
             },
             function=self._run_command,
-            type=ToolType.COMMAND
+            type=ToolType.COMMAND,
+            permission_level=PermissionLevel.CRITICAL  # Shell commands are critical
         ))
-        
-        # Code analysis
+
+        # Code analysis - SAFE
         self.register(Tool(
             name="analyze_code",
             description="Analyze Python code for issues",
@@ -106,10 +248,11 @@ class ToolRegistry:
                 "code": {"type": "string", "description": "Code to analyze"}
             },
             function=self._analyze_code,
-            type=ToolType.FUNCTION
+            type=ToolType.FUNCTION,
+            permission_level=PermissionLevel.SAFE  # Analysis is safe
         ))
-        
-        # Search
+
+        # Search - SAFE
         self.register(Tool(
             name="search_codebase",
             description="Search for patterns in codebase",
@@ -118,7 +261,8 @@ class ToolRegistry:
                 "path": {"type": "string", "description": "Path to search", "default": "."}
             },
             function=self._search_codebase,
-            type=ToolType.FUNCTION
+            type=ToolType.FUNCTION,
+            permission_level=PermissionLevel.SAFE  # Searching is safe
         ))
         
     async def _read_file(self, path: str) -> Dict:
@@ -237,8 +381,10 @@ class ToolRegistry:
             return {"success": False, "error": str(e)}
 
 class ToolCaller:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(self, registry: ToolRegistry, approval_tracker: Optional[ApprovalTracker] = None):
         self.registry = registry
+        self.approval_tracker = approval_tracker or ApprovalTracker()
+        self.approval_callback = None  # Will be set by UI to handle approval requests
         
     def extract_tool_calls(self, response: str) -> List[Dict]:
         """Extract tool calls from model response"""
@@ -282,17 +428,74 @@ class ToolCaller:
                     
         return tool_calls
         
+    def set_approval_callback(self, callback):
+        """Set callback function for requesting user approval"""
+        self.approval_callback = callback
+
+    async def _request_approval(self, tool_name: str, arguments: Dict, permission_level: PermissionLevel) -> bool:
+        """Request user approval for tool execution"""
+        # If no callback is set, deny critical operations by default
+        if not self.approval_callback:
+            if permission_level == PermissionLevel.CRITICAL:
+                logger.warning(f"⚠️ No approval callback set, denying critical operation: {tool_name}")
+                return False
+            return True  # Allow non-critical if no callback
+
+        # Request approval through callback
+        try:
+            approved = await self.approval_callback(tool_name, arguments, permission_level)
+            return approved
+        except Exception as e:
+            logger.error(f"❌ Approval callback failed: {e}")
+            return False
+
     async def execute_tool_calls(self, tool_calls: List[Dict]) -> List[Dict]:
-        """Execute extracted tool calls"""
+        """Execute extracted tool calls with approval checks"""
         results = []
-        
+
         for call in tool_calls:
             tool_name = call.get("tool") or call.get("name")
-            arguments = call.get("arguments", {})
-            
+            arguments = call.get("arguments", {}) or call.get("parameters", {})
+
+            # Get tool info
+            tool = self.registry.get(tool_name)
+            if not tool:
+                results.append({
+                    "tool": tool_name,
+                    "error": "Tool not found",
+                    "approved": False
+                })
+                continue
+
+            # Check if operation needs approval
+            permission_level = tool.permission_level
+            is_auto_approved = self.approval_tracker.is_approved(tool_name, arguments, permission_level)
+
+            if not is_auto_approved:
+                # Need to request approval
+                logger.info(f"🔐 Requesting approval for {permission_level.value} operation: {tool_name}")
+
+                approved = await self._request_approval(tool_name, arguments, permission_level)
+
+                if not approved:
+                    logger.warning(f"⛔ Operation denied by user: {tool_name}")
+                    results.append({
+                        "tool": tool_name,
+                        "error": "Operation denied by user",
+                        "approved": False,
+                        "permission_level": permission_level.value
+                    })
+                    continue
+
+                # Record approval
+                self.approval_tracker.record_approval(tool_name, arguments, permission_level, auto_approved=False)
+            else:
+                # Auto-approved, still record it
+                self.approval_tracker.record_approval(tool_name, arguments, permission_level, auto_approved=True)
+
             # Log to console
             logger.info(f"🔨 Tool call: {tool_name} with args: {arguments}")
-            
+
             # Also log to terminal if available
             try:
                 import streamlit as st
@@ -302,26 +505,32 @@ class ToolCaller:
                     term_logger.log_tool_call(tool_name, arguments)
             except:
                 pass
-            
-            tool = self.registry.get(tool_name)
-            if tool and tool.function:
+
+            # Execute tool
+            if tool.function:
                 try:
                     result = await tool.function(**arguments)
                     results.append({
                         "tool": tool_name,
-                        "result": result
+                        "result": result,
+                        "approved": True,
+                        "permission_level": permission_level.value,
+                        "auto_approved": is_auto_approved
                     })
                 except Exception as e:
                     results.append({
                         "tool": tool_name,
-                        "error": str(e)
+                        "error": str(e),
+                        "approved": True,
+                        "execution_failed": True
                     })
-                    
+
                     # Log error to console
                     logger.error(f"❌ Tool {tool_name} failed: {e}")
-                    
+
                     # Also log to terminal if available
                     try:
+                        import streamlit as st
                         if hasattr(st.session_state, 'terminal'):
                             term_logger.log_error(f"Tool {tool_name} failed: {e}", "Tools")
                     except:
@@ -329,9 +538,10 @@ class ToolCaller:
             else:
                 results.append({
                     "tool": tool_name,
-                    "error": "Tool not found"
+                    "error": "Tool function not available",
+                    "approved": True
                 })
-                
+
         return results
         
     def format_tools_for_prompt(self) -> str:

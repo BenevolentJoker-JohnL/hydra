@@ -1,13 +1,16 @@
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ConcurrentTaskRunner
-from typing import Dict, List, Any, Optional
+from typing import List, Any, Optional
 import asyncio
 import json
 from datetime import timedelta
 from loguru import logger
 
+# Use lowercase dict/list for Pydantic v2 compatibility
+# typing.Dict causes issues with Prefect 2.20+ and Pydantic v2
+
 @task(retries=3, retry_delay_seconds=10, cache_key_fn=lambda x: x.get('cache_key'))
-async def analyze_code_request(request: Dict) -> Dict:
+async def analyze_code_request(request: dict) -> dict:
     flow_logger = get_run_logger()
     flow_logger.info(f"Analyzing request: {request.get('prompt', '')[:100]}...")
     
@@ -51,7 +54,7 @@ async def analyze_code_request(request: Dict) -> Dict:
     }
 
 @task(retries=2)
-async def decompose_into_subtasks(analyzed_request: Dict) -> List[Dict]:
+async def decompose_into_subtasks(analyzed_request: dict) -> list[dict]:
     logger = get_run_logger()
     logger.info(f"Decomposing task {analyzed_request['task_id']}")
     
@@ -79,7 +82,7 @@ async def decompose_into_subtasks(analyzed_request: Dict) -> List[Dict]:
     return subtasks
 
 @task(retries=3)
-async def execute_subtask(subtask: Dict, model_pool: List[str]) -> Dict:
+async def execute_subtask(subtask: dict, model_pool: list[str]) -> dict:
     logger = get_run_logger()
     logger.info(f"Executing subtask {subtask['id']} with {len(model_pool)} models")
     
@@ -108,7 +111,7 @@ async def execute_subtask(subtask: Dict, model_pool: List[str]) -> Dict:
     }
 
 @task(retries=2)
-async def synthesize_code(subtask_results: List[Dict], original_request: Dict) -> Dict:
+async def synthesize_code(subtask_results: list[dict], original_request: dict) -> dict:
     flow_logger = get_run_logger()
     flow_logger.info(f"Synthesizing {len(subtask_results)} subtask results")
     
@@ -150,7 +153,7 @@ async def synthesize_code(subtask_results: List[Dict], original_request: Dict) -
     }
 
 @task
-async def store_in_memory(result: Dict) -> bool:
+async def store_in_memory(result: dict) -> bool:
     logger = get_run_logger()
     logger.info(f"Storing result for task {result['task_id']}")
     
@@ -173,8 +176,8 @@ async def store_in_memory(result: Dict) -> bool:
     
     return stored
 
-@flow(task_runner=ConcurrentTaskRunner(), persist_result=True)
-async def code_generation_pipeline(request: Dict) -> Dict:
+@flow(task_runner=ConcurrentTaskRunner())
+async def code_generation_pipeline(request: dict) -> dict:
     logger = get_run_logger()
     logger.info("Starting code generation pipeline")
     
@@ -237,7 +240,7 @@ async def code_generation_pipeline(request: Dict) -> Dict:
     return result
 
 @flow
-async def batch_code_generation(requests: List[Dict]) -> List[Dict]:
+async def batch_code_generation(requests: list[dict]) -> list[dict]:
     logger = get_run_logger()
     logger.info(f"Processing batch of {len(requests)} requests")
     
