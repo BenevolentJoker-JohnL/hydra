@@ -213,7 +213,7 @@ class ToolRegistry:
 
         self.register(Tool(
             name="write_file",
-            description="Write content to a file (CRITICAL: modifies filesystem)",
+            description="Write content to a file (CRITICAL: replaces entire file)",
             parameters={
                 "path": {"type": "string", "description": "File path to write"},
                 "content": {"type": "string", "description": "Content to write"}
@@ -221,6 +221,71 @@ class ToolRegistry:
             function=self._write_file,
             type=ToolType.FILE,
             permission_level=PermissionLevel.CRITICAL  # Writing is critical - always needs approval
+        ))
+
+        self.register(Tool(
+            name="read_lines",
+            description="Read specific lines or line range from a file",
+            parameters={
+                "path": {"type": "string", "description": "File path to read"},
+                "start_line": {"type": "integer", "description": "Starting line number (1-indexed)", "optional": True},
+                "end_line": {"type": "integer", "description": "Ending line number (inclusive)", "optional": True}
+            },
+            function=self._read_lines,
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.SAFE
+        ))
+
+        self.register(Tool(
+            name="insert_lines",
+            description="Insert lines at a specific position (CRITICAL: modifies file)",
+            parameters={
+                "path": {"type": "string", "description": "File path"},
+                "line_number": {"type": "integer", "description": "Line number to insert at (1-indexed)"},
+                "content": {"type": "string", "description": "Content to insert"}
+            },
+            function=self._insert_lines,
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.CRITICAL
+        ))
+
+        self.register(Tool(
+            name="delete_lines",
+            description="Delete specific lines or line range (CRITICAL: modifies file)",
+            parameters={
+                "path": {"type": "string", "description": "File path"},
+                "start_line": {"type": "integer", "description": "Starting line number (1-indexed)"},
+                "end_line": {"type": "integer", "description": "Ending line number (inclusive)", "optional": True}
+            },
+            function=self._delete_lines,
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.CRITICAL
+        ))
+
+        self.register(Tool(
+            name="replace_lines",
+            description="Replace specific lines with new content (CRITICAL: modifies file)",
+            parameters={
+                "path": {"type": "string", "description": "File path"},
+                "start_line": {"type": "integer", "description": "Starting line number (1-indexed)"},
+                "end_line": {"type": "integer", "description": "Ending line number (inclusive)"},
+                "new_content": {"type": "string", "description": "New content to replace with"}
+            },
+            function=self._replace_lines,
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.CRITICAL
+        ))
+
+        self.register(Tool(
+            name="append_to_file",
+            description="Append content to end of file (CRITICAL: modifies file)",
+            parameters={
+                "path": {"type": "string", "description": "File path"},
+                "content": {"type": "string", "description": "Content to append"}
+            },
+            function=self._append_to_file,
+            type=ToolType.FILE,
+            permission_level=PermissionLevel.CRITICAL
         ))
 
         self.register(Tool(
@@ -348,7 +413,180 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"❌ Failed to write {path}: {e}")
             return {"success": False, "error": str(e)}
-            
+
+    async def _read_lines(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> Dict:
+        """Read specific lines from a file"""
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+
+            # Convert to 0-indexed
+            start = (start_line - 1) if start_line else 0
+            end = end_line if end_line else len(lines)
+
+            selected_lines = lines[start:end]
+            content = ''.join(selected_lines)
+
+            return {
+                "success": True,
+                "content": content,
+                "lines": selected_lines,
+                "start_line": start_line or 1,
+                "end_line": end_line or len(lines),
+                "total_lines": len(lines)
+            }
+        except Exception as e:
+            logger.error(f"❌ Failed to read lines from {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _insert_lines(self, path: str, line_number: int, content: str) -> Dict:
+        """Insert lines at specific position"""
+        try:
+            # Read existing content
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+            else:
+                lines = []
+
+            # Insert new content (convert to 0-indexed)
+            insert_pos = max(0, line_number - 1)
+            new_lines = content.splitlines(keepends=True)
+            if new_lines and not new_lines[-1].endswith('\n'):
+                new_lines[-1] += '\n'
+
+            lines[insert_pos:insert_pos] = new_lines
+            new_content = ''.join(lines)
+
+            # Generate diff and write
+            result = await self._write_file_with_diff(path, new_content)
+            result["operation"] = "insert"
+            result["line_number"] = line_number
+            result["lines_inserted"] = len(new_lines)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Failed to insert lines in {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _delete_lines(self, path: str, start_line: int, end_line: Optional[int] = None) -> Dict:
+        """Delete specific lines from file"""
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+
+            # Convert to 0-indexed
+            start = max(0, start_line - 1)
+            end = end_line if end_line else start_line
+
+            # Delete lines
+            deleted_lines = lines[start:end]
+            del lines[start:end]
+            new_content = ''.join(lines)
+
+            # Generate diff and write
+            result = await self._write_file_with_diff(path, new_content)
+            result["operation"] = "delete"
+            result["start_line"] = start_line
+            result["end_line"] = end_line or start_line
+            result["lines_deleted"] = len(deleted_lines)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Failed to delete lines from {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _replace_lines(self, path: str, start_line: int, end_line: int, new_content: str) -> Dict:
+        """Replace specific lines with new content"""
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+
+            # Convert to 0-indexed
+            start = max(0, start_line - 1)
+            end = end_line
+
+            # Replace lines
+            new_lines = new_content.splitlines(keepends=True)
+            if new_lines and not new_lines[-1].endswith('\n'):
+                new_lines[-1] += '\n'
+
+            lines[start:end] = new_lines
+            new_file_content = ''.join(lines)
+
+            # Generate diff and write
+            result = await self._write_file_with_diff(path, new_file_content)
+            result["operation"] = "replace"
+            result["start_line"] = start_line
+            result["end_line"] = end_line
+            result["lines_replaced"] = end - start
+            result["new_lines"] = len(new_lines)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Failed to replace lines in {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _append_to_file(self, path: str, content: str) -> Dict:
+        """Append content to end of file"""
+        try:
+            # Read existing content
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    existing = f.read()
+            else:
+                existing = ""
+
+            # Append new content
+            new_content = existing + content
+            if not new_content.endswith('\n'):
+                new_content += '\n'
+
+            # Generate diff and write
+            result = await self._write_file_with_diff(path, new_content)
+            result["operation"] = "append"
+            result["content_appended"] = len(content)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Failed to append to {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _write_file_with_diff(self, path: str, content: str) -> Dict:
+        """Helper method to write file with git diff (shared by line operations)"""
+        result = {"success": True, "path": path}
+
+        # Git integration
+        if self.git and self.git.is_git_repo():
+            try:
+                file_change = self.git.create_file_change(path, content)
+                result["diff"] = file_change.diff
+                result["change_type"] = file_change.change_type
+                result["git_enabled"] = True
+
+                # Create branch if needed
+                status = self.git.get_status()
+                if not status.current_branch.startswith(self.git.hydra_branch_prefix):
+                    success, branch_name = self.git.create_hydra_branch("file-edits")
+                    if success:
+                        result["branch_created"] = branch_name
+                        logger.info(f"📝 Created branch for edits: {branch_name}")
+            except Exception as git_error:
+                logger.warning(f"Git operations failed: {git_error}")
+                result["git_enabled"] = False
+
+        # Write file
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(content)
+
+        logger.success(f"✅ Wrote file: {path}")
+        return result
+
     async def _list_directory(self, path: str) -> Dict:
         try:
             files = os.listdir(path)
