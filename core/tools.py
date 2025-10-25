@@ -161,8 +161,25 @@ class ApprovalTracker:
         }
 
 class ToolRegistry:
-    def __init__(self):
+    def __init__(self, use_git: bool = True, project_dir: str = "."):
         self.tools = {}
+        self.use_git = use_git
+        self.git = None
+
+        # Initialize git integration if enabled
+        if use_git:
+            try:
+                from .git_integration import GitIntegration
+                self.git = GitIntegration(project_dir)
+                if self.git.is_git_repo():
+                    logger.info("✅ Git integration enabled for tools")
+                else:
+                    logger.info("📁 Not a git repo, git integration disabled")
+                    self.git = None
+            except Exception as e:
+                logger.warning(f"⚠️ Git integration unavailable: {e}")
+                self.git = None
+
         self._register_default_tools()
         
     def register(self, tool: Tool):
@@ -264,6 +281,28 @@ class ToolRegistry:
             type=ToolType.FUNCTION,
             permission_level=PermissionLevel.SAFE  # Searching is safe
         ))
+
+        # Git operations
+        if self.git and self.git.is_git_repo():
+            self.register(Tool(
+                name="git_commit",
+                description="Commit current changes with a message",
+                parameters={
+                    "message": {"type": "string", "description": "Commit message"}
+                },
+                function=self._git_commit,
+                type=ToolType.COMMAND,
+                permission_level=PermissionLevel.REQUIRES_APPROVAL  # Commits need approval but can auto-approve
+            ))
+
+            self.register(Tool(
+                name="git_status",
+                description="Get git repository status",
+                parameters={},
+                function=self._git_status,
+                type=ToolType.FUNCTION,
+                permission_level=PermissionLevel.SAFE
+            ))
         
     async def _read_file(self, path: str) -> Dict:
         try:
@@ -275,11 +314,39 @@ class ToolRegistry:
             
     async def _write_file(self, path: str, content: str) -> Dict:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Git-aware file writing
+            result = {"success": True, "path": path}
+
+            # If git integration is available, generate diff first
+            if self.git and self.git.is_git_repo():
+                try:
+                    # Generate diff before writing
+                    file_change = self.git.create_file_change(path, content)
+                    result["diff"] = file_change.diff
+                    result["change_type"] = file_change.change_type
+                    result["git_enabled"] = True
+
+                    # Create Hydra branch if not on one
+                    status = self.git.get_status()
+                    if not status.current_branch.startswith(self.git.hydra_branch_prefix):
+                        success, branch_name = self.git.create_hydra_branch("file-edits")
+                        if success:
+                            result["branch_created"] = branch_name
+                            logger.info(f"📝 Created branch for edits: {branch_name}")
+                except Exception as git_error:
+                    logger.warning(f"Git operations failed, proceeding without git: {git_error}")
+                    result["git_enabled"] = False
+
+            # Write the file
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
             with open(path, 'w') as f:
                 f.write(content)
-            return {"success": True, "path": path}
+
+            logger.success(f"✅ Wrote file: {path}")
+            return result
+
         except Exception as e:
+            logger.error(f"❌ Failed to write {path}: {e}")
             return {"success": False, "error": str(e)}
             
     async def _list_directory(self, path: str) -> Dict:
@@ -377,6 +444,45 @@ class ToolRegistry:
                         })
                         
             return {"success": True, "matches": matches[:20]}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def _git_commit(self, message: str) -> Dict:
+        """Commit current changes"""
+        if not self.git:
+            return {"success": False, "error": "Git not available"}
+
+        try:
+            success = self.git.commit_changes(message)
+            if success:
+                status = self.git.get_status()
+                return {
+                    "success": True,
+                    "message": "Changes committed",
+                    "branch": status.current_branch,
+                    "commit_message": message
+                }
+            else:
+                return {"success": False, "error": "Commit failed"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def _git_status(self) -> Dict:
+        """Get git repository status"""
+        if not self.git:
+            return {"success": False, "error": "Git not available"}
+
+        try:
+            status = self.git.get_status()
+            return {
+                "success": True,
+                "is_repo": status.is_repo,
+                "current_branch": status.current_branch,
+                "is_clean": status.is_clean,
+                "modified_files": status.modified_files,
+                "untracked_files": status.untracked_files,
+                "staged_files": status.staged_files
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 

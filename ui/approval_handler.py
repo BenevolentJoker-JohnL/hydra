@@ -55,11 +55,39 @@ class ApprovalHandler:
         st.markdown("### 🔐 Pending Approval Requests")
 
         for idx, request in enumerate(st.session_state.pending_approvals):
-            with st.expander(f"⚠️ Approve {request['tool']}? (Permission: {request['permission_level']})", expanded=True):
+            # Extract diff info if available (Claude Code style)
+            has_diff = 'diff' in request.get('arguments', {})
+            change_type = request.get('arguments', {}).get('change_type', 'modify')
+
+            icon = "📝" if change_type == "modify" else "➕" if change_type == "create" else "🔧"
+
+            with st.expander(f"{icon} Approve {request['tool']}? (Permission: {request['permission_level']})", expanded=True):
                 st.markdown(f"**Tool**: `{request['tool']}`")
                 st.markdown(f"**Permission Level**: `{request['permission_level']}`")
-                st.markdown("**Arguments**:")
-                st.json(request['arguments'])
+
+                # Show git branch info if available
+                if 'branch_created' in request.get('arguments', {}):
+                    st.info(f"📦 Changes will be made on branch: `{request['arguments']['branch_created']}`")
+
+                # Show diff if available (Claude Code style!)
+                if has_diff:
+                    diff_content = request['arguments']['diff']
+                    file_path = request['arguments'].get('path', 'unknown')
+
+                    st.markdown(f"**File**: `{file_path}`")
+                    st.markdown(f"**Change Type**: `{change_type}`")
+
+                    if diff_content:
+                        st.markdown("**📊 Diff:**")
+                        st.code(diff_content, language="diff")
+                    else:
+                        st.info("New file (no previous content)")
+                else:
+                    st.markdown("**Arguments**:")
+                    # Filter out internal fields from display
+                    display_args = {k: v for k, v in request['arguments'].items()
+                                   if k not in ['diff', 'change_type', 'branch_created', 'git_enabled']}
+                    st.json(display_args)
 
                 # Show warning for CRITICAL operations
                 if request['permission_level'] == 'critical':
