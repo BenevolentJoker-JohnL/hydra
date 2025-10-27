@@ -17,8 +17,8 @@ code_synthesis:
     - codellama:13b
     # Medium models (good balance)
     - qwen2.5-coder:7b
-    - deepseek-coder:6.7b
-    - codellama:7b
+    - deepseek-coder:latest
+    - codellama:latest
     # Small models (fallback for low memory)
     - qwen2.5:3b
     - qwen2.5:1.5b

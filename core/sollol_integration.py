@@ -14,19 +14,24 @@ With:
 - Auto-discovery of Ollama nodes
 - Intelligent model-to-node placement
 - Automatic GPU → CPU fallback
+- Multi-mode routing (FAST, RELIABLE, ASYNC)
 """
 
 import asyncio
-from typing import Dict, List, Any, Optional, AsyncGenerator
+from typing import Dict, List, Any, Optional, AsyncGenerator, Callable
 from loguru import logger
 from collections import defaultdict
 from datetime import datetime
+from enum import Enum
+from dataclasses import dataclass, field
+import statistics
 
 # Import SOLLOL components
 try:
     from sollol import OllamaPool
     from sollol import UnifiedDashboard, run_unified_dashboard
     from sollol.config import SOLLOLConfig
+    from sollol.routing_modes import RoutingMode, TaskPriority
     SOLLOL_AVAILABLE = True
 except ImportError:
     logger.warning("SOLLOL not installed. Run: pip install sollol>=0.9.52")
@@ -34,6 +39,11 @@ except ImportError:
     OllamaPool = None
     UnifiedDashboard = None
     SOLLOLConfig = None
+    RoutingMode = None
+    TaskPriority = None
+
+# Import memory manager
+from .memory_manager import get_ollama_lifecycle_manager
 
 
 class SOLLOLIntegration:
@@ -62,8 +72,36 @@ class SOLLOLIntegration:
         self.config = config or {}
         self.app_name = self.config.get('app_name', 'Hydra')
 
+        # Store default routing mode from config (async for parallel distribution)
+        self.default_routing_mode = self.config.get('default_routing_mode', 'async')
+
+        # Initialize memory lifecycle manager
+        self.lifecycle_mgr = get_ollama_lifecycle_manager()
+        logger.info("🧠 Ollama memory lifecycle manager initialized")
+
+        # Track node load for CPU-only routing
+        self.node_request_counts = {}  # node_url -> active request count
+        self.node_last_used = {}  # node_url -> timestamp
+
         # Create SOLLOL config
         sollol_config = SOLLOLConfig()
+
+        # Parse manual nodes from environment if specified
+        import os
+        manual_nodes_str = os.getenv('SOLLOL_MANUAL_NODES', '')
+        manual_nodes = []
+        if manual_nodes_str:
+            for node_str in manual_nodes_str.split(','):
+                node_str = node_str.strip()
+                if ':' in node_str:
+                    host, port = node_str.rsplit(':', 1)
+                    manual_nodes.append({'host': host, 'port': int(port)})
+                else:
+                    manual_nodes.append({'host': node_str, 'port': 11434})
+            logger.info(f"📝 Manual nodes specified: {len(manual_nodes)} nodes")
+
+        # Check if network scanning is enabled
+        scan_network = os.getenv('SOLLOL_SCAN_NETWORK', 'true').lower() == 'true'
 
         # Initialize SOLLOL OllamaPool with app registration
         # Note: Only pass parameters that are supported by the current SOLLOL version
@@ -72,8 +110,19 @@ class SOLLOLIntegration:
             'register_with_dashboard': self.config.get('register_with_dashboard', True),
             'enable_intelligent_routing': True,
             'redis_host': self.config.get('redis_host', 'localhost'),
-            'redis_port': self.config.get('redis_port', 6379)
+            'redis_port': self.config.get('redis_port', 6379),
+            # Enable network discovery to find all Ollama nodes
+            'exclude_localhost': False,
+            'discover_all_nodes': scan_network,  # Scan network for ALL nodes
+            # Enable Ray and Dask for distributed processing
+            'enable_ray': True,
+            'enable_dask': True
         }
+
+        # Add manual nodes if specified
+        if manual_nodes:
+            pool_kwargs['nodes'] = manual_nodes
+            logger.info(f"Adding {len(manual_nodes)} manually configured nodes")
 
         # Try to add VRAM monitoring if supported by SOLLOL version
         try:
@@ -103,15 +152,30 @@ class SOLLOLIntegration:
     async def initialize(self):
         """Initialize SOLLOL pool, discover nodes, and start dashboard"""
         if not self.initialized:
-            logger.info("🔍 Starting SOLLOL node discovery...")
+            import os
+            scan_network = os.getenv('SOLLOL_SCAN_NETWORK', 'true').lower() == 'true'
+
+            if scan_network:
+                logger.info("🔍 Starting SOLLOL network-wide node discovery...")
+                logger.info("   This may take 10-30 seconds to scan the network...")
+            else:
+                logger.info("🔍 Starting SOLLOL node discovery (localhost only)...")
 
             # Initialize the pool (discovers nodes automatically)
-            # Note: OllamaPool.auto_configure() already initializes,
-            # but we can call list() to trigger discovery if needed
+            # Note: OllamaPool.auto_configure() already initializes and discovers nodes
             try:
-                nodes = await self.pool.list_nodes()
+                # Access the nodes attribute directly (already populated by __init__)
+                nodes = self.pool.nodes
+                logger.info(f"✅ Discovery complete! Found {len(nodes)} node(s)")
+
                 self.hosts = [f"http://{node['host']}:{node['port']}" for node in nodes]
                 self.health_status = {f"http://{node['host']}:{node['port']}": node.get('healthy', True) for node in nodes}
+
+                # Log each discovered node
+                for node in nodes:
+                    node_url = f"http://{node['host']}:{node['port']}"
+                    status = "🟢 healthy" if node.get('healthy', True) else "🔴 unhealthy"
+                    logger.info(f"   • {node_url} - {status}")
 
                 # Create node registry for compatibility
                 for node in nodes:
@@ -148,9 +212,27 @@ class SOLLOLIntegration:
             # Start SOLLOL dashboard if enabled
             if self.dashboard_enabled:
                 try:
+                    import threading
                     logger.info(f"🎨 Launching SOLLOL Unified Dashboard on port {self.dashboard_port}...")
-                    self.dashboard = UnifiedDashboard(port=self.dashboard_port)
-                    await self.dashboard.start()
+                    self.dashboard = UnifiedDashboard(
+                        router=getattr(self.pool, 'router', None),
+                        dashboard_port=self.dashboard_port,
+                        enable_dask=True
+                    )
+
+                    # Run dashboard in background thread
+                    dashboard_thread = threading.Thread(
+                        target=self.dashboard.run,
+                        kwargs={'host': '0.0.0.0', 'debug': False, 'allow_fallback': True},
+                        daemon=True,
+                        name='SOLLOL-Dashboard'
+                    )
+                    dashboard_thread.start()
+
+                    # Give it a moment to start
+                    import time
+                    time.sleep(2)
+
                     logger.success(f"✅ SOLLOL Dashboard available at http://localhost:{self.dashboard_port}")
                 except Exception as e:
                     logger.warning(f"Failed to start SOLLOL dashboard: {e}. Continuing without dashboard.")
@@ -168,9 +250,19 @@ class SOLLOLIntegration:
     # OllamaLoadBalancer API Compatibility
     # =================================================================
 
-    async def generate(self, model: str, prompt: str, node_id: Optional[str] = None,
-                      prefer_local: bool = True, min_vram_gb: Optional[float] = None,
-                      **kwargs) -> Dict[str, Any]:
+    async def generate(
+        self,
+        model: str,
+        prompt: str,
+        node_id: Optional[str] = None,
+        prefer_local: bool = True,
+        min_vram_gb: Optional[float] = None,
+        routing_mode: Optional[str] = None,
+        prefer_cpu: bool = False,
+        min_success_rate: float = 0.0,
+        priority: int = 5,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
         Generate response from model (non-streaming) with intelligent routing.
 
@@ -180,6 +272,10 @@ class SOLLOLIntegration:
             node_id: Optional specific node ID to use
             prefer_local: Prefer local node if it has sufficient resources (default: True)
             min_vram_gb: Minimum VRAM required in GB (optional)
+            routing_mode: Routing mode ("fast", "reliable", "async"). If None, uses default routing
+            prefer_cpu: For ASYNC mode - intentionally prefer CPU nodes to free GPU (default: False)
+            min_success_rate: For RELIABLE mode - minimum node success rate 0.0-1.0 (default: 0.0)
+            priority: Request priority 1-10 (default: 5)
             **kwargs: Additional parameters (temperature, top_p, etc.)
 
         Returns:
@@ -226,7 +322,23 @@ class SOLLOLIntegration:
                     logger.info(f"📊 Resource-aware routing selected node: {target_node['id']} "
                               f"(VRAM: {target_node.get('vram_available', 0):.1f}GB available)")
 
-            # Use SOLLOL's generate method
+            # Convert routing_mode string to enum if provided, or use default
+            routing_mode_enum = None
+            mode_to_use = routing_mode or self.default_routing_mode
+
+            if mode_to_use and SOLLOL_AVAILABLE and RoutingMode:
+                routing_mode_lower = mode_to_use.lower()
+                if routing_mode_lower == "fast":
+                    routing_mode_enum = RoutingMode.FAST
+                elif routing_mode_lower == "reliable":
+                    routing_mode_enum = RoutingMode.RELIABLE
+                elif routing_mode_lower == "async":
+                    routing_mode_enum = RoutingMode.ASYNC
+                else:
+                    logger.warning(f"Unknown routing mode '{mode_to_use}', using FAST mode")
+                    routing_mode_enum = RoutingMode.FAST
+
+            # Use SOLLOL's generate method with routing mode support
             # SOLLOL automatically routes based on resources, health, and performance
             # Our target_node selection above influences the preference but SOLLOL makes final decision
             response = await self.pool.generate(
@@ -234,7 +346,10 @@ class SOLLOLIntegration:
                 prompt=prompt,
                 options=options,
                 stream=False,
-                priority=kwargs.pop('priority', 5)  # Higher priority = better resource allocation
+                priority=priority,
+                routing_mode=routing_mode_enum,
+                prefer_cpu=prefer_cpu,
+                min_success_rate=min_success_rate
             )
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -262,12 +377,32 @@ class SOLLOLIntegration:
             logger.error(f"❌ Generation failed for {model}: {e}")
             raise
 
-    async def generate_stream(self, model: str, prompt: str, **kwargs) -> AsyncGenerator:
+    async def generate_stream(
+        self,
+        model: str,
+        prompt: str,
+        routing_mode: Optional[str] = None,
+        priority: int = 5,
+        min_success_rate: float = 0.0,
+        prefer_cpu: bool = False,
+        **kwargs
+    ) -> AsyncGenerator:
         """
-        Stream generation from model.
+        Stream generation from model with routing mode support.
         Compatible with OllamaLoadBalancer.generate_stream()
+
+        Args:
+            model: Model name
+            prompt: Prompt text
+            routing_mode: Routing mode ("fast", "reliable", "async", or None for auto)
+            priority: Request priority 1-10
+            min_success_rate: Minimum success rate for RELIABLE mode
+            prefer_cpu: Prefer CPU for ASYNC mode
+            **kwargs: Additional parameters (temperature, top_p, etc.)
         """
         logger.info(f"🤖 Streaming from {model}")
+        if routing_mode:
+            logger.info(f"🧭 Routing mode: {routing_mode.upper()} (priority: {priority})")
 
         try:
             # Extract Ollama-specific parameters
@@ -279,13 +414,66 @@ class SOLLOLIntegration:
             if 'repeat_penalty' in kwargs:
                 options['repeat_penalty'] = kwargs.pop('repeat_penalty')
 
-            # Use SOLLOL's streaming generation
-            # Check if pool.generate returns an async generator or regular generator
+            # Add memory management: set keep_alive based on model size
+            # Large models (14B+) unload immediately to free memory
+            # Small models stay loaded for faster subsequent requests
+            keep_alive = self.lifecycle_mgr.get_keep_alive(model)
+            if keep_alive is not None:
+                options['keep_alive'] = keep_alive
+                if keep_alive == 0:
+                    logger.debug(f"🗑️  {model} will unload immediately after use (large model)")
+
+            # Convert routing_mode string to enum if provided, or use default
+            routing_mode_enum = None
+            mode_to_use = routing_mode or self.default_routing_mode
+
+            if mode_to_use and SOLLOL_AVAILABLE and RoutingMode:
+                routing_mode_lower = mode_to_use.lower()
+                if routing_mode_lower == "fast":
+                    routing_mode_enum = RoutingMode.FAST
+                elif routing_mode_lower == "reliable":
+                    routing_mode_enum = RoutingMode.RELIABLE
+                elif routing_mode_lower == "async":
+                    routing_mode_enum = RoutingMode.ASYNC
+                else:
+                    logger.warning(f"Unknown routing mode '{mode_to_use}', using FAST mode")
+                    routing_mode_enum = RoutingMode.FAST
+
+            # Use SOLLOL's streaming generation with routing modes
+            # IMPORTANT: SOLLOL's pool.generate() should handle node retries internally,
+            # but if it fails, the error bubbles up here. This is expected behavior -
+            # the pool tries ALL available nodes before failing.
+
+            # For CPU-only environments: enable prefer_cpu to distribute across all nodes
+            # instead of preferring local node
+            actual_prefer_cpu = prefer_cpu
+            if routing_mode_enum == RoutingMode.ASYNC and not prefer_cpu:
+                # In async mode without explicit prefer_cpu, enable it for CPU-only nodes
+                actual_prefer_cpu = True
+                logger.debug("🖥️  Enabling prefer_cpu for CPU-only node distribution")
+
+            # Proactively free memory on all nodes if loading a large model
+            model_size = self.lifecycle_mgr.estimate_size(model)
+            if model_size >= self.lifecycle_mgr.LARGE_MODEL_THRESHOLD_GB:
+                logger.info(f"🧹 Proactively freeing memory for large model {model} ({model_size:.1f}GB)")
+                # Free memory on all discovered nodes since we don't know which SOLLOL will pick
+                for node_url in self.hosts:
+                    try:
+                        freed = await self.lifecycle_mgr.free_memory(node_url, model)
+                        if freed > 0:
+                            logger.info(f"✨ Freed memory on {node_url} ({freed} models unloaded)")
+                    except Exception as e:
+                        logger.debug(f"Failed to free memory on {node_url}: {e}")
+
             stream_result = self.pool.generate(
                 model=model,
                 prompt=prompt,
                 options=options,
-                stream=True
+                stream=True,
+                priority=priority,
+                routing_mode=routing_mode_enum,
+                prefer_cpu=actual_prefer_cpu,
+                min_success_rate=min_success_rate
             )
 
             # If it's an async generator, use async for
@@ -298,7 +486,19 @@ class SOLLOLIntegration:
                     yield chunk
 
         except Exception as e:
-            logger.error(f"❌ Stream failed for {model}: {e}")
+            # Log failure with available node count for debugging
+            available_nodes = len(self.hosts)
+            logger.error(f"❌ Stream failed for {model} after trying {available_nodes} node(s): {e}")
+
+            # Log which nodes were attempted
+            if available_nodes > 1:
+                logger.warning(f"⚠️  All {available_nodes} nodes failed to stream {model}")
+                logger.warning(f"   Available nodes: {', '.join(self.hosts)}")
+                logger.warning("   This suggests either:")
+                logger.warning("   1. All nodes are out of VRAM/resources")
+                logger.warning("   2. Model not available on any node")
+                logger.warning("   3. All nodes are experiencing errors")
+
             raise
 
     async def embed(self, model: str, input: str) -> List[float]:

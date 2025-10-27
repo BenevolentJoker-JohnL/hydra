@@ -14,6 +14,8 @@ from loguru import logger
 from .json_pipeline import JSONPipeline, CodeResponseSchema, ExplanationResponseSchema, AnalysisResponseSchema
 from .memory_manager import get_memory_manager
 from .tools import ToolRegistry, ToolCaller, ApprovalTracker
+from .code_formatter import CodeFormatter
+from .autonomous_agent import AutonomousAgent, AgentConfig
 
 class CodeTaskType(Enum):
     """Types of code tasks we can handle"""
@@ -148,16 +150,16 @@ class CodeAssistant:
         self.detector = TaskDetector()
         self.json_pipeline = JSONPipeline(load_balancer)
         
-        # Task-specific model preferences
+        # Task-specific model preferences (7B and smaller, available on BOTH nodes)
         self.task_models = {
-            CodeTaskType.GENERATE: ['qwen2.5-coder:14b', 'deepseek-coder:latest', 'codestral:latest'],
-            CodeTaskType.DEBUG: ['qwen2.5-coder:14b', 'deepseek-coder:latest', 'llama3.2:latest'],
-            CodeTaskType.EXPLAIN: ['llama3.2:latest', 'mistral:latest', 'qwen2.5:14b'],
-            CodeTaskType.TROUBLESHOOT: ['qwen2.5-coder:14b', 'llama3.2:latest'],
-            CodeTaskType.REFACTOR: ['qwen2.5-coder:14b', 'codestral:latest'],
-            CodeTaskType.REVIEW: ['qwen2.5-coder:14b', 'llama3.2:latest'],
-            CodeTaskType.OPTIMIZE: ['qwen2.5-coder:14b', 'deepseek-coder:latest'],
-            CodeTaskType.TEST: ['qwen2.5-coder:14b', 'codestral:latest'],
+            CodeTaskType.GENERATE: ['qwen2.5-coder:7b', 'deepseek-coder:latest', 'codellama:latest'],
+            CodeTaskType.DEBUG: ['qwen2.5-coder:7b', 'deepseek-coder:latest', 'llama3.2:latest'],
+            CodeTaskType.EXPLAIN: ['llama3.2:latest', 'mistral:latest', 'qwen2.5-coder:3b'],
+            CodeTaskType.TROUBLESHOOT: ['qwen2.5-coder:7b', 'llama3.2:latest'],
+            CodeTaskType.REFACTOR: ['qwen2.5-coder:7b', 'codellama:latest'],
+            CodeTaskType.REVIEW: ['qwen2.5-coder:7b', 'llama3.2:latest'],
+            CodeTaskType.OPTIMIZE: ['qwen2.5-coder:7b', 'deepseek-coder:latest'],
+            CodeTaskType.TEST: ['qwen2.5-coder:7b', 'qwen2.5-coder:3b'],
             CodeTaskType.DOCUMENT: ['llama3.2:latest', 'mistral:latest']
         }
     
@@ -236,16 +238,45 @@ class CodeAssistant:
     
     async def _handle_generate(self, task: CodeTask) -> Dict:
         """Handle code generation"""
+        # Build context section if provided
+        context_section = ""
+        if task.context:
+            if 'documentation' in task.context:
+                context_section += f"\n## Reference Documentation\n{task.context['documentation']}\n"
+            if 'examples' in task.context:
+                context_section += f"\n## Examples to Follow\n{task.context['examples']}\n"
+            if 'requirements' in task.context:
+                context_section += f"\n## Additional Requirements\n{task.context['requirements']}\n"
+            # Include any other context as additional information
+            for key, value in task.context.items():
+                if key not in ['documentation', 'examples', 'requirements', 'task_type']:
+                    context_section += f"\n## {key.replace('_', ' ').title()}\n{value}\n"
+
         enhanced_prompt = f"""Generate {task.language} code for the following request:
 
 {task.prompt}
+{context_section}
 
-Requirements:
+CRITICAL FORMATTING REQUIREMENTS:
+- Format ALL code in proper markdown code blocks with language identifier (```{task.language})
+- Use correct syntax and indentation (4 spaces for Python, 2 for JavaScript)
+- Code must be directly executable - no placeholders, no incomplete sections
+- Include ALL necessary imports at the top
+- If documentation or examples are provided above, FOLLOW THEM EXACTLY
+- Use the exact API patterns shown in provided documentation
+- Code should be production-ready and actionable
+
+Quality Standards:
 - Write clean, efficient, and well-structured code
-- Include necessary imports
 - Follow best practices for {task.language}
-- Add brief inline comments for complex logic
-"""
+- Add brief inline comments only for complex logic
+- Ensure proper error handling
+- Make code copy-paste ready
+
+Output Format:
+```{task.language}
+# Your complete, executable code here
+```"""
         
         if self.lb:
             models = self.task_models[CodeTaskType.GENERATE]
@@ -257,21 +288,33 @@ Requirements:
     
     async def _handle_debug(self, task: CodeTask) -> Dict:
         """Handle debugging"""
+        # Build context section
+        context_section = ""
+        if task.context:
+            if 'error' in task.context:
+                context_section += f"\n**Error Message:**\n```\n{task.context['error']}\n```\n"
+            if 'documentation' in task.context:
+                context_section += f"\n**Reference Documentation:**\n{task.context['documentation']}\n"
+
         enhanced_prompt = f"""Debug the following {task.language} code:
 
 ```{task.language}
 {task.code}
 ```
 
-Problem: {task.prompt}
-{f"Error message: {task.context.get('error')}" if task.context and 'error' in task.context else ""}
+**Problem:** {task.prompt}
+{context_section}
 
 Provide:
-1. The issue identification
-2. Root cause analysis
-3. Fixed code
-4. Explanation of the fix
-"""
+1. **Issue Identification** - What's wrong
+2. **Root Cause Analysis** - Why it's happening
+3. **Fixed Code** - Format in proper markdown code block with language tag
+4. **Explanation** - How the fix works
+
+CRITICAL: Output the fixed code in a proper markdown code block:
+```{task.language}
+# Fixed, executable code here
+```"""
         
         if self.lb:
             models = self.task_models[CodeTaskType.DEBUG]
@@ -333,13 +376,22 @@ Provide:
     
     async def _handle_refactor(self, task: CodeTask) -> Dict:
         """Handle code refactoring"""
+        # Build context section
+        context_section = ""
+        if task.context:
+            if 'documentation' in task.context:
+                context_section += f"\n**Reference Documentation:**\n{task.context['documentation']}\n"
+            if 'style_guide' in task.context:
+                context_section += f"\n**Style Guide:**\n{task.context['style_guide']}\n"
+
         enhanced_prompt = f"""Refactor the following {task.language} code:
 
 ```{task.language}
 {task.code}
 ```
 
-Requirements: {task.prompt}
+**Requirements:** {task.prompt}
+{context_section}
 
 Focus on:
 1. Code clarity and readability
@@ -347,7 +399,14 @@ Focus on:
 3. Better organization
 4. Performance improvements
 5. Following {task.language} best practices
-"""
+6. If documentation is provided, follow its patterns
+
+CRITICAL: Output the refactored code in a proper markdown code block:
+```{task.language}
+# Refactored, executable code here
+```
+
+Include a brief explanation of the changes made."""
         
         if self.lb:
             models = self.task_models[CodeTaskType.REFACTOR]
@@ -384,20 +443,33 @@ Provide:
     
     async def _handle_optimize(self, task: CodeTask) -> Dict:
         """Handle performance optimization"""
+        # Build context section
+        context_section = ""
+        if task.context:
+            if 'profiling_data' in task.context:
+                context_section += f"\n**Profiling Data:**\n{task.context['profiling_data']}\n"
+            if 'documentation' in task.context:
+                context_section += f"\n**Reference Documentation:**\n{task.context['documentation']}\n"
+
         enhanced_prompt = f"""Optimize the following {task.language} code for performance:
 
 ```{task.language}
 {task.code}
 ```
 
-Focus: {task.prompt}
+**Focus:** {task.prompt}
+{context_section}
 
 Provide:
-1. Performance bottleneck analysis
-2. Optimized version of the code
-3. Complexity analysis (before/after)
-4. Expected performance improvements
-"""
+1. **Performance Bottleneck Analysis** - Identify slow parts
+2. **Optimized Code** - Format in proper markdown code block
+3. **Complexity Analysis** - Before/after (O notation)
+4. **Expected Improvements** - Quantify the gains
+
+CRITICAL: Output the optimized code in a proper markdown code block:
+```{task.language}
+# Optimized, executable code here
+```"""
         
         if self.lb:
             models = self.task_models[CodeTaskType.OPTIMIZE]
@@ -409,18 +481,36 @@ Provide:
     
     async def _handle_test(self, task: CodeTask) -> Dict:
         """Handle test generation"""
+        # Build context section
+        context_section = ""
+        if task.context:
+            if 'test_framework' in task.context:
+                context_section += f"\n**Test Framework:** {task.context['test_framework']}\n"
+            if 'coverage_target' in task.context:
+                context_section += f"\n**Coverage Target:** {task.context['coverage_target']}\n"
+            if 'documentation' in task.context:
+                context_section += f"\n**Reference Documentation:**\n{task.context['documentation']}\n"
+
         enhanced_prompt = f"""Generate comprehensive tests for the following {task.language} code:
 
 ```{task.language}
 {task.code}
 ```
+{context_section}
 
 Requirements:
 1. Unit tests for all functions/methods
 2. Edge cases and error conditions
-3. Use appropriate testing framework
-4. Include test documentation
-"""
+3. Use appropriate testing framework (pytest for Python, Jest for JavaScript, etc.)
+4. Include test documentation and assertions
+5. Tests should be executable and follow best practices
+
+CRITICAL: Output the test code in a proper markdown code block:
+```{task.language}
+# Complete, executable test code here
+```
+
+Include a brief explanation of the test coverage."""
         
         if self.lb:
             models = self.task_models[CodeTaskType.TEST]
@@ -476,48 +566,139 @@ Include:
 class StreamingCodeAssistant(CodeAssistant):
     """Code assistant with streaming support"""
 
-    def __init__(self, load_balancer):
+    def __init__(self, load_balancer, orchestrator=None):
         super().__init__(load_balancer)
         # Initialize tool registry and approval system
         self.tool_registry = ToolRegistry()
         self.approval_tracker = ApprovalTracker()
         self.tool_caller = ToolCaller(self.tool_registry, self.approval_tracker)
 
-    async def process_stream(self, prompt: str, context: Dict = None, use_tools: bool = False):
-        """Process with streaming output"""
+        # Initialize autonomous agent if orchestrator available
+        self.orchestrator = orchestrator
+        self.autonomous_agent = None
+        if orchestrator and load_balancer:
+            try:
+                self.autonomous_agent = AutonomousAgent(
+                    reasoning_engine=orchestrator.reasoning_engine,
+                    orchestrator=orchestrator,
+                    tool_caller=self.tool_caller,
+                    config=AgentConfig()
+                )
+                logger.info("🤖 Autonomous agent initialized and ready")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize autonomous agent: {e}")
+
+    async def process_stream(
+        self,
+        prompt: str,
+        context: Dict = None,
+        use_tools: bool = False,
+        autonomous: bool = False,
+        routing_mode: Optional[str] = None,
+        priority: int = 5,
+        min_success_rate: float = 0.0,
+        prefer_cpu: bool = False
+    ):
+        """Process with streaming output
+
+        Args:
+            prompt: User prompt
+            context: Additional context
+            use_tools: Enable tool calling (single-pass)
+            autonomous: Enable autonomous agent mode (iterative multi-step)
+            routing_mode: SOLLOL routing mode
+            priority: Request priority
+            min_success_rate: Minimum success rate for routing
+            prefer_cpu: Prefer CPU nodes
+        """
         context = context or {}
+
+        # AUTONOMOUS MODE: Full Claude-style iterative execution
+        if autonomous and self.autonomous_agent:
+            logger.info("🤖 Autonomous mode enabled - agent will iteratively solve the task")
+            async for update in self.autonomous_agent.execute_autonomous(
+                task=prompt,
+                context=context
+            ):
+                yield update
+            return
+        elif autonomous and not self.autonomous_agent:
+            logger.warning("⚠️ Autonomous mode requested but agent not available, falling back to tools mode")
+            use_tools = True  # Fallback to tool mode
 
         # If tools are enabled and task benefits from tools, use tool-enabled generation
         if use_tools:
             logger.info("🔧 Tool use enabled for this request")
-            async for chunk in self._process_stream_with_tools(prompt, context):
+            async for chunk in self._process_stream_with_tools(
+                prompt,
+                context,
+                routing_mode=routing_mode,
+                priority=priority,
+                min_success_rate=min_success_rate,
+                prefer_cpu=prefer_cpu
+            ):
                 yield chunk
             return
 
         # Detect task type
         task_type = self.detector.detect_task_type(prompt, context)
         logger.info(f"🎯 Streaming task: {task_type.value}")
-        
+
         # Get appropriate model
         models = self.task_models[task_type]
-        
+
         successful_stream = False
+        full_response = ""
         for i, model in enumerate(models):
             try:
                 logger.info(f"Attempting stream with {model} ({i+1}/{len(models)})")
-                
+                if routing_mode:
+                    logger.info(f"🧭 Using routing mode: {routing_mode.upper()} (priority: {priority})")
+
                 async for chunk in self.lb.generate_stream(
                     model=model,
-                    prompt=prompt
+                    prompt=prompt,
+                    routing_mode=routing_mode,
+                    priority=priority,
+                    min_success_rate=min_success_rate,
+                    prefer_cpu=prefer_cpu
                     # NO TIMEOUT - resource constrained systems need time
                 ):
                     if 'response' in chunk:
+                        full_response += chunk['response']
                         yield {
                             'task_type': task_type.value,
                             'chunk': chunk['response'],
                             'model': model,
-                            'done': chunk.get('done', False)
+                            'done': chunk.get('done', False),
+                            'pre_format': True  # Mark as pre-formatting
                         }
+
+                # Streaming complete - format the full response
+                if full_response and task_type in [CodeTaskType.GENERATE, CodeTaskType.DEBUG,
+                                                     CodeTaskType.REFACTOR, CodeTaskType.OPTIMIZE,
+                                                     CodeTaskType.TEST]:
+                    logger.info("✨ Formatting code blocks in response...")
+                    formatted_response = CodeFormatter.standardize_response(full_response, 'python')
+
+                    if formatted_response != full_response:
+                        # Yield the corrected version
+                        yield {
+                            'task_type': task_type.value,
+                            'chunk': f"\n\n---\n**✨ Code automatically formatted with black/autopep8**\n\n",
+                            'model': model,
+                            'done': False,
+                            'formatting_notice': True
+                        }
+                        yield {
+                            'task_type': task_type.value,
+                            'chunk': formatted_response,
+                            'model': model,
+                            'done': True,
+                            'formatted': True,
+                            'replace_all': True  # Signal to replace entire response
+                        }
+
                 successful_stream = True
                 break
             except Exception as e:
@@ -552,8 +733,25 @@ class StreamingCodeAssistant(CodeAssistant):
                     logger.info(f"Trying next model...")
                     continue
 
-    async def _process_stream_with_tools(self, prompt: str, context: Dict = None):
-        """Process streaming with tool support"""
+    async def _process_stream_with_tools(
+        self,
+        prompt: str,
+        context: Dict = None,
+        routing_mode: Optional[str] = None,
+        priority: int = 5,
+        min_success_rate: float = 0.0,
+        prefer_cpu: bool = False
+    ):
+        """Process streaming with tool support
+
+        Args:
+            prompt: User prompt
+            context: Additional context
+            routing_mode: Routing mode ("fast", "reliable", "async", or None for auto)
+            priority: Request priority 1-10
+            min_success_rate: Minimum success rate for RELIABLE mode
+            prefer_cpu: Prefer CPU for ASYNC mode
+        """
         # Detect task type
         task_type = self.detector.detect_task_type(prompt, context)
         logger.info(f"🎯 Tool-enabled streaming task: {task_type.value}")
@@ -583,10 +781,16 @@ After using tools, continue with your response based on the tool results."""
         for i, model in enumerate(models):
             try:
                 logger.info(f"🔧 Streaming with tools using {model}")
+                if routing_mode:
+                    logger.info(f"🧭 Using routing mode: {routing_mode.upper()} (priority: {priority})")
 
                 async for chunk in self.lb.generate_stream(
                     model=model,
-                    prompt=enhanced_prompt
+                    prompt=enhanced_prompt,
+                    routing_mode=routing_mode,
+                    priority=priority,
+                    min_success_rate=min_success_rate,
+                    prefer_cpu=prefer_cpu
                 ):
                     if 'response' in chunk:
                         full_response += chunk['response']

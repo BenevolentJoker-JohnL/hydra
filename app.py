@@ -10,6 +10,26 @@ from loguru import logger
 from core.logging_config import configure_logging
 from utils.async_helpers import run_async, AsyncContextManager
 import nest_asyncio
+import warnings
+import logging
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Suppress noisy warnings
+# - Streamlit context warnings: harmless, occur during multiprocessing initialization
+# - Plotly deprecation warnings: non-critical, will be fixed in future Streamlit releases
+# - Distributed warnings: port conflicts are handled automatically
+warnings.filterwarnings('ignore', category=UserWarning, module='streamlit.runtime.scriptrunner_utils.script_run_context')
+warnings.filterwarnings('ignore', category=UserWarning, module='streamlit.runtime.state.session_state_proxy')
+warnings.filterwarnings('ignore', category=UserWarning, module='streamlit.elements.plotly_chart')
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=UserWarning, module='distributed.node')
+logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
+logging.getLogger('streamlit.runtime.state.session_state_proxy').setLevel(logging.ERROR)
+logging.getLogger('streamlit.elements.plotly_chart').setLevel(logging.ERROR)
+logging.getLogger('distributed.node').setLevel(logging.ERROR)
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -43,6 +63,7 @@ from ui.file_handler import FileHandler, render_file_upload_zone, create_file_re
 from ui.terminal import Terminal, GenerationLogger, render_terminal_panel
 from ui.approval_handler import ApprovalHandler, render_approval_stats, setup_auto_approval_rules
 from core.tools import ToolRegistry, ToolEnhancedGenerator
+from core.user_preferences import get_preferences_manager
 import yaml
 
 st.set_page_config(
@@ -61,6 +82,23 @@ if 'model_stats' not in st.session_state:
     st.session_state.model_stats = {}
 if 'enhanced_project_manager' not in st.session_state:
     st.session_state.enhanced_project_manager = EnhancedProjectManager()
+
+# Initialize preferences manager
+if 'preferences_manager' not in st.session_state:
+    st.session_state.preferences_manager = get_preferences_manager()
+    # Load saved preferences into session state
+    routing_prefs = st.session_state.preferences_manager.get_routing_preferences()
+    ui_prefs = st.session_state.preferences_manager.get_ui_preferences()
+
+    st.session_state.routing_mode = routing_prefs.mode
+    st.session_state.priority = routing_prefs.priority
+    st.session_state.min_success_rate = routing_prefs.min_success_rate
+    st.session_state.prefer_cpu = routing_prefs.prefer_cpu
+
+    st.session_state.use_context_default = ui_prefs.use_context
+    st.session_state.use_tools_default = ui_prefs.use_tools
+    st.session_state.use_reasoning_default = ui_prefs.use_reasoning
+    st.session_state.create_artifacts_default = ui_prefs.create_artifacts
 
 @st.cache_resource
 def initialize_system():
@@ -82,7 +120,8 @@ def initialize_system():
         'dashboard_port': int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080')),
         'redis_host': os.getenv('REDIS_HOST', 'localhost'),
         'redis_port': int(os.getenv('REDIS_PORT', '6379')),
-        'log_level': os.getenv('SOLLOL_LOG_LEVEL', 'INFO').upper()
+        'log_level': os.getenv('SOLLOL_LOG_LEVEL', 'INFO').upper(),
+        'default_routing_mode': os.getenv('SOLLOL_DEFAULT_ROUTING_MODE', 'async').lower()
     }
 
     logger.info(f"🚀 Initializing Hydra with SOLLOL...")
@@ -104,12 +143,36 @@ def initialize_system():
         logger.info(f"✅ SOLLOL initialized successfully")
         logger.info(f"📊 Discovered {len(sollol.hosts)} Ollama nodes")
 
+        # Print discovered nodes for debugging
+        if len(sollol.hosts) == 0:
+            print("\n" + "!"*70)
+            print("⚠️  WARNING: NO OLLAMA NODES DISCOVERED!")
+            print("!"*70)
+            print("SOLLOL couldn't find any Ollama nodes.")
+            print("\nTroubleshooting:")
+            print("1. Make sure Ollama is running: systemctl status ollama")
+            print("2. Test connection: curl http://localhost:11434/api/tags")
+            print("3. Check SOLLOL discovery settings in .env")
+            print("!"*70 + "\n")
+        else:
+            print(f"\n✅ Discovered {len(sollol.hosts)} Ollama node(s):")
+            for host in sollol.hosts:
+                print(f"   • {host}")
+            print()
+
         if sollol.dashboard_enabled and sollol.dashboard:
-            logger.info(f"🎨 SOLLOL Dashboard: http://localhost:{sollol.dashboard_port}")
+            # Print prominent dashboard URL banner
+            print("\n" + "="*70)
+            print(f"🎯 SOLLOL UNIFIED DASHBOARD")
+            print(f"   URL: http://localhost:{sollol.dashboard_port}")
+            print(f"   Features: Node monitoring, VRAM tracking, routing logs, metrics")
+            print("="*70 + "\n")
+            logger.info(f"🎨 SOLLOL Dashboard running on port {sollol.dashboard_port}")
 
         # Initialize orchestrator with SOLLOL
         orchestrator = ModelOrchestrator(sollol)
-        code_assistant = StreamingCodeAssistant(sollol)
+        # Pass orchestrator to code assistant for autonomous agent support
+        code_assistant = StreamingCodeAssistant(sollol, orchestrator)
 
         # Setup approval handler and auto-approval rules
         setup_auto_approval_rules(code_assistant.approval_tracker)
@@ -123,14 +186,14 @@ def initialize_system():
         traceback.print_exc()
         # Return None for sollol but still create other objects
         orchestrator = None
-        code_assistant = StreamingCodeAssistant(None)
+        code_assistant = StreamingCodeAssistant(None, None)
 
         # Setup approval handler even on error
         setup_auto_approval_rules(code_assistant.approval_tracker)
 
         return None, orchestrator, config, code_assistant
 
-async def process_code_request_stream(prompt: str, context: Dict = None, use_tools: bool = False):
+async def process_code_request_stream(prompt: str, context: Dict = None, use_tools: bool = False, autonomous: bool = False):
     """Process code request with streaming response using Code Assistant"""
     sollol, orchestrator, config, code_assistant = initialize_system()
     
@@ -168,17 +231,53 @@ async def process_code_request_stream(prompt: str, context: Dict = None, use_too
         st.info("You can download Ollama from: https://ollama.com/download")
         st.code("# After installing, run:\ncurl -fsSL https://ollama.com/install.sh | sh\nsudo systemctl start ollama", language="bash")
         return {'response': 'Ollama connection required', 'error': True}
+
+    # Check if we have any nodes discovered
+    if len(sollol.hosts) == 0:
+        st.error("⚠️ NO OLLAMA NODES DISCOVERED!")
+        st.warning("""
+        SOLLOL couldn't find any Ollama nodes.
+
+        **Troubleshooting:**
+        1. Check if Ollama is running: `systemctl status ollama`
+        2. Test connection: `curl http://localhost:11434/api/tags`
+        3. Restart Streamlit app to retry discovery
+        4. Check SOLLOL logs above for details
+        """)
+        return {'response': 'No Ollama nodes available', 'error': True}
     
     # Use Code Assistant for intelligent handling
     try:
         # Stream the response
         logger.log_orchestration(f"Starting {task_type.value} task")
 
-        async for chunk_data in code_assistant.process_stream(prompt, context, use_tools=use_tools):
+        # Get routing settings from session state (set in UI)
+        routing_mode = st.session_state.get('routing_mode', None)
+        priority = st.session_state.get('priority', 5)
+        min_success_rate = st.session_state.get('min_success_rate', 0.0)
+        prefer_cpu = st.session_state.get('prefer_cpu', False)
+
+        async for chunk_data in code_assistant.process_stream(
+            prompt,
+            context,
+            use_tools=use_tools,
+            autonomous=autonomous,
+            routing_mode=routing_mode,
+            priority=priority,
+            min_success_rate=min_success_rate,
+            prefer_cpu=prefer_cpu
+        ):
             if 'chunk' in chunk_data:
-                full_response += chunk_data['chunk']
-                # Update the placeholder with streaming content
-                response_placeholder.markdown(full_response)
+                # Check if this is a formatted replacement
+                if chunk_data.get('replace_all', False):
+                    # Replace entire response with formatted version
+                    full_response = chunk_data['chunk']
+                    response_placeholder.markdown(full_response)
+                    logger.log_success(f"✨ Code automatically formatted")
+                else:
+                    # Normal streaming - append chunks
+                    full_response += chunk_data['chunk']
+                    response_placeholder.markdown(full_response)
 
                 # Log streaming progress
                 if chunk_data.get('done', False):
@@ -252,14 +351,42 @@ async def process_code_request(prompt: str, context: Dict = None):
     return result
 
 def main():
+    # Print dashboard info on first run (before any UI rendering)
+    if 'dashboard_banner_shown' not in st.session_state:
+        dashboard_port = int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080'))
+        print("\n" + "="*70)
+        print("🐉 HYDRA - INTELLIGENT CODE SYNTHESIS")
+        print("="*70)
+        print(f"📊 SOLLOL Dashboard: http://localhost:{dashboard_port}")
+        print(f"💬 Streamlit UI: http://localhost:8502")
+        print("="*70 + "\n")
+        st.session_state.dashboard_banner_shown = True
+
     # Title with version
-    col1, col2, col3 = st.columns([3, 1, 1])
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
     with col1:
         st.title("🐉 Hydra - Intelligent Code Synthesis")
     with col2:
         st.caption("v1.0.0")
-        st.caption(f"Models: {len(st.session_state.model_stats)}")
+        # Dashboard link
+        dashboard_port = int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080'))
+        st.markdown(f"[📊 Dashboard](http://localhost:{dashboard_port})", unsafe_allow_html=True)
     with col3:
+        # New Chat button
+        if st.button("🆕 New Chat", key="new_chat_btn", help="Start a fresh conversation"):
+            # Clear messages
+            if hasattr(st.session_state, 'current_project'):
+                # If in a project, clear project chat history
+                st.session_state.current_project.chat_history = []
+                pm = st.session_state.enhanced_project_manager
+                pm.save_project(st.session_state.current_project)
+                st.success("✅ Project chat cleared!")
+            else:
+                # Clear global messages
+                st.session_state.messages = []
+                st.success("✅ Chat cleared!")
+            st.rerun()
+    with col4:
         # Quick project selector
         if hasattr(st.session_state, 'current_project'):
             st.info(f"📁 {st.session_state.current_project.name}")
@@ -439,22 +566,133 @@ def chat_interface():
                                 st.caption(f"📎 {file_info['name']}: {file_info['size'] / 1024:.1f} KB (binary)")
         
         # Input area with enhanced features
-        col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([2.2, 1, 1, 1, 1, 1, 0.9])
 
         with col1:
             prompt = st.chat_input("Enter your coding request...")
 
         with col2:
-            use_context = st.checkbox("Context", value=True, help="Include project context")
+            use_context = st.checkbox(
+                "Context",
+                value=st.session_state.get('use_context_default', True),
+                help="Include project context"
+            )
 
         with col3:
-            use_tools = st.checkbox("Tools", value=True, help="Enable tool usage")
+            use_tools = st.checkbox(
+                "Tools",
+                value=st.session_state.get('use_tools_default', True),
+                help="Enable tool usage"
+            )
 
         with col4:
-            use_reasoning = st.checkbox("🧠 Reasoning", value=False, help="Use Claude-style reasoning (slower, higher quality)")
+            use_reasoning = st.checkbox(
+                "🧠 Reasoning",
+                value=st.session_state.get('use_reasoning_default', False),
+                help="Use Claude-style reasoning (slower, higher quality)"
+            )
 
         with col5:
-            create_artifact = st.checkbox("Artifact", value=True, help="Create artifacts")
+            use_autonomous = st.checkbox(
+                "🤖 Autonomous",
+                value=st.session_state.get('use_autonomous_default', False),
+                help="Multi-step iterative solving (Claude Code style) - requires Tools to be enabled"
+            )
+
+        with col6:
+            use_consensus = st.checkbox(
+                "🗳️ Consensus",
+                value=st.session_state.get('use_consensus_default', False),
+                help="Multi-model voting for higher quality (slower)"
+            )
+
+        with col7:
+            create_artifact = st.checkbox(
+                "📦 Artifact",
+                value=st.session_state.get('create_artifacts_default', True),
+                help="Save code blocks"
+            )
+
+        # Routing mode selection (below input controls)
+        with st.expander("⚙️ Advanced Routing Settings", expanded=False):
+            routing_col1, routing_col2, routing_col3, routing_col4 = st.columns(4)
+
+            # Get saved routing mode for index
+            saved_mode = st.session_state.get('routing_mode', None)
+            mode_options = ["Auto", "Fast", "Reliable", "Async"]
+            if saved_mode is None:
+                mode_index = 0
+            else:
+                mode_index = mode_options.index(saved_mode.capitalize()) if saved_mode.capitalize() in mode_options else 0
+
+            with routing_col1:
+                routing_mode = st.selectbox(
+                    "Routing Mode",
+                    options=mode_options,
+                    index=mode_index,
+                    help="""
+                    • **Auto**: Use default routing strategy
+                    • **Fast**: GPU-first, lowest latency (user-facing tasks)
+                    • **Reliable**: Stability over speed (production code, critical tasks)
+                    • **Async**: CPU-preferred, resource-efficient (background tasks)
+                    """
+                )
+
+            with routing_col2:
+                priority = st.slider(
+                    "Priority",
+                    min_value=1,
+                    max_value=10,
+                    value=st.session_state.get('priority', 5),
+                    help="Request priority (1=lowest, 10=urgent)"
+                )
+
+            with routing_col3:
+                min_success_rate = st.slider(
+                    "Min Success Rate (Reliable)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=st.session_state.get('min_success_rate', 0.95),
+                    step=0.05,
+                    help="Minimum node success rate for RELIABLE mode"
+                )
+
+            with routing_col4:
+                prefer_cpu = st.checkbox(
+                    "Prefer CPU (Async)",
+                    value=st.session_state.get('prefer_cpu', False),
+                    help="Intentionally use CPU to free GPU for ASYNC mode"
+                )
+
+            # Store routing settings in session state AND save to preferences
+            new_routing_mode = None if routing_mode == "Auto" else routing_mode.lower()
+
+            # Check if settings changed and save
+            settings_changed = (
+                st.session_state.get('routing_mode') != new_routing_mode or
+                st.session_state.get('priority') != priority or
+                st.session_state.get('min_success_rate') != min_success_rate or
+                st.session_state.get('prefer_cpu') != prefer_cpu
+            )
+
+            st.session_state.routing_mode = new_routing_mode
+            st.session_state.priority = priority
+            st.session_state.min_success_rate = min_success_rate
+            st.session_state.prefer_cpu = prefer_cpu
+
+            if settings_changed and 'preferences_manager' in st.session_state:
+                # Save to persistent preferences
+                st.session_state.preferences_manager.update_routing_preferences(
+                    mode=new_routing_mode,
+                    priority=priority,
+                    min_success_rate=min_success_rate,
+                    prefer_cpu=prefer_cpu
+                )
+
+            # Add button to reset to defaults
+            if st.button("🔄 Reset to Defaults", help="Reset routing settings to defaults"):
+                st.session_state.preferences_manager.reset_to_defaults()
+                st.rerun()
     
     if prompt:
         # Parse file references in prompt
@@ -531,7 +769,13 @@ def chat_interface():
 
                 # Use reasoning mode if enabled
                 if use_reasoning:
-                    _, orchestrator, _, _ = initialize_system()
+                    # Use cached orchestrator from session state if available (preserves settings)
+                    if 'orchestrator' in st.session_state and st.session_state.orchestrator:
+                        orchestrator = st.session_state.orchestrator
+                    else:
+                        _, orchestrator, _, _ = initialize_system()
+                        st.session_state.orchestrator = orchestrator
+
                     if orchestrator:
                         # Use reasoning engine for higher quality
                         response_placeholder = st.empty()
@@ -550,7 +794,7 @@ def chat_interface():
                         return {'response': full_response, 'thinking': thinking_content}
 
                 # Use standard streaming version
-                result = await process_code_request_stream(prompt, context, use_tools=use_tools)
+                result = await process_code_request_stream(prompt, context, use_tools=use_tools, autonomous=use_autonomous)
                 return result
             
             # Use streaming for better UX (with async helper)
@@ -655,7 +899,25 @@ def chat_interface():
 
 def dashboard():
     st.header("📊 System Dashboard")
-    
+
+    # SOLLOL Dashboard Link (prominent)
+    dashboard_port = int(os.getenv('SOLLOL_DASHBOARD_PORT', '8080'))
+    st.info(f"""
+    **🎯 SOLLOL Unified Dashboard**
+
+    Real-time monitoring of distributed Ollama nodes, routing decisions, and performance metrics.
+
+    👉 **[Open SOLLOL Dashboard](http://localhost:{dashboard_port})** (opens in new tab)
+
+    Features:
+    - Live node status and VRAM usage
+    - Routing decision logs
+    - Request/response metrics
+    - Multi-application coordination
+    """)
+
+    st.divider()
+
     # Key metrics
     col1, col2, col3, col4 = st.columns(4)
     
@@ -680,7 +942,7 @@ def dashboard():
                         65, 70, 68, 65, 60, 55, 48, 40, 35, 30, 25, 20]
         })
         fig = px.line(requests, x='Time', y='Requests', title='Requests over Last 24 Hours')
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     
     with col2:
         st.subheader("Model Performance")
@@ -690,7 +952,7 @@ def dashboard():
             'Avg Tokens/s': [45, 38, 42, 35, 40]
         })
         fig = px.bar(model_data, x='Model', y='Success Rate', title='Model Success Rates (%)')
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     
     # System Health
     st.subheader("System Health")
@@ -723,7 +985,7 @@ def workflow_management():
             "ETA": ["5 min", "12 min", "Waiting"]
         })
         
-        st.dataframe(workflows_df, width='stretch')
+        st.dataframe(workflows_df, use_container_width=True)
         
         # Progress bars
         for _, row in workflows_df.iterrows():
@@ -839,7 +1101,7 @@ def memory_explorer():
         
         fig = px.line(cache_data, x='Date', y=['Hit Rate', 'Miss Rate'],
                      title='Cache Performance Over Time')
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
 def settings_panel():
     st.header("⚙️ Settings")
@@ -924,7 +1186,13 @@ def settings_panel():
         """)
 
         # Initialize orchestrator to access reasoning settings
-        _, orchestrator, _, _ = initialize_system()
+        # Use cached orchestrator from session state if available
+        if 'orchestrator' in st.session_state and st.session_state.orchestrator:
+            orchestrator = st.session_state.orchestrator
+        else:
+            _, orchestrator, _, _ = initialize_system()
+            if orchestrator:
+                st.session_state.orchestrator = orchestrator
 
         if orchestrator is None:
             st.error("Orchestrator not initialized. Please check SOLLOL connection.")
@@ -1095,6 +1363,9 @@ def settings_panel():
                     deep_thinking_iterations=deep_thinking_iterations,
                     deep_thinking_threshold=deep_thinking_threshold
                 )
+
+                # Store updated orchestrator in session state so it persists across requests
+                st.session_state.orchestrator = orchestrator
 
                 st.success("✅ Applied to current session!")
 

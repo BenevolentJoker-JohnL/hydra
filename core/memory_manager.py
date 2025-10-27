@@ -295,3 +295,197 @@ def get_memory_manager() -> MemoryManager:
     if _memory_manager is None:
         _memory_manager = MemoryManager()
     return _memory_manager
+
+
+# ==============================================================================
+# Ollama Model Lifecycle Manager
+# ==============================================================================
+
+import asyncio
+import httpx
+from typing import Dict, List, Optional
+from datetime import datetime
+
+
+class OllamaModelLifecycleManager:
+    """
+    Manages Ollama model lifecycle to prevent OOM crashes
+
+    Uses Ollama's keep_alive parameter and /api/ps endpoint to:
+    - Unload large models immediately after use
+    - Free memory before loading new large models
+    - Prevent OOM crashes from too many loaded models
+    """
+
+    # Model size estimates (GB)
+    MODEL_SIZES = {
+        "qwen2.5-coder:14b": 9.0,
+        "qwen2.5-coder:7b": 5.0,
+        "qwen2.5-coder:3b": 2.0,
+        "qwen2.5-coder:1.5b": 1.0,
+        "deepseek-coder-v2:latest": 9.0,
+        "deepseek-coder-v2:16b": 9.0,
+        "deepseek-coder:33b": 19.0,
+        "deepseek-coder:6.7b": 4.0,
+        "codestral:latest": 13.0,
+        "codellama:13b": 8.0,
+        "codellama:7b": 4.0,
+        "stable-code:3b": 2.0,
+        "codegemma:7b": 4.0,
+        "llama3.1:70b": 43.0,
+        "qwen3:14b": 9.0,
+        "qwen3:8b": 5.0,
+        "qwen3:4b": 2.5,
+        "qwen3:1.7b": 1.0,
+        "mistral:latest": 4.5,
+        "llama3.2:3b": 2.0,
+    }
+
+    LARGE_MODEL_THRESHOLD_GB = 8.0  # Models > 8GB trigger aggressive management
+
+    def __init__(self):
+        self.loaded_cache: Dict[str, List[str]] = {}  # node_url -> [models]
+        self.cache_time: Dict[str, datetime] = {}
+
+    def estimate_size(self, model_name: str) -> float:
+        """Estimate model size in GB"""
+        if model_name in self.MODEL_SIZES:
+            return self.MODEL_SIZES[model_name]
+
+        # Infer from name
+        name_lower = model_name.lower()
+        if "70b" in name_lower:
+            return 43.0
+        elif "33b" in name_lower:
+            return 19.0
+        elif "14b" in name_lower:
+            return 9.0
+        elif "13b" in name_lower:
+            return 8.0
+        elif "7b" in name_lower or "8b" in name_lower:
+            return 5.0
+        elif "3b" in name_lower or "4b" in name_lower:
+            return 2.0
+        elif "1.5b" in name_lower or "1.7b" in name_lower:
+            return 1.0
+        return 5.0  # Conservative default
+
+    async def get_loaded_models(self, node_url: str, force: bool = False) -> List[str]:
+        """Get currently loaded models from Ollama /api/ps"""
+        # Cache for 10 seconds
+        if not force and node_url in self.cache_time:
+            age = (datetime.now() - self.cache_time[node_url]).total_seconds()
+            if age < 10:
+                return self.loaded_cache.get(node_url, [])
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{node_url}/api/ps")
+                resp.raise_for_status()
+                data = resp.json()
+
+                loaded = []
+                if "models" in data:
+                    for m in data["models"]:
+                        if "name" in m:
+                            loaded.append(m["name"])
+
+                self.loaded_cache[node_url] = loaded
+                self.cache_time[node_url] = datetime.now()
+                return loaded
+
+        except Exception as e:
+            logger.debug(f"Failed to get loaded models from {node_url}: {e}")
+            return self.loaded_cache.get(node_url, [])
+
+    async def unload_model(self, node_url: str, model: str) -> bool:
+        """Unload model by sending generate with keep_alive=0"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{node_url}/api/generate",
+                    json={"model": model, "prompt": "", "keep_alive": 0},
+                    timeout=10.0
+                )
+                logger.info(f"🗑️  Unloaded {model} from {node_url}")
+
+                # Update cache
+                if node_url in self.loaded_cache:
+                    if model in self.loaded_cache[node_url]:
+                        self.loaded_cache[node_url].remove(model)
+                return True
+
+        except Exception as e:
+            logger.warning(f"Failed to unload {model}: {e}")
+            return False
+
+    async def free_memory(self, node_url: str, model_to_load: str) -> int:
+        """
+        Free memory before loading a large model
+
+        Returns number of models unloaded
+        """
+        size = self.estimate_size(model_to_load)
+
+        # Only manage memory for large models
+        if size < self.LARGE_MODEL_THRESHOLD_GB:
+            return 0
+
+        logger.info(f"🧹 Freeing memory on {node_url} for {model_to_load} ({size:.1f}GB)")
+
+        loaded = await self.get_loaded_models(node_url, force=True)
+        if not loaded:
+            return 0
+
+        # Sort by size (unload largest first)
+        by_size = sorted(loaded, key=self.estimate_size, reverse=True)
+
+        unloaded_count = 0
+        freed_gb = 0.0
+
+        for model in by_size:
+            if model == model_to_load:
+                continue
+
+            if await self.unload_model(node_url, model):
+                freed_gb += self.estimate_size(model)
+                unloaded_count += 1
+
+                # Unload enough to make room
+                if freed_gb >= size:
+                    logger.success(f"✨ Freed {freed_gb:.1f}GB ({unloaded_count} models)")
+                    break
+
+        return unloaded_count
+
+    def get_keep_alive(self, model_name: str) -> int:
+        """
+        Get recommended keep_alive for model
+
+        Returns:
+            0 = unload immediately
+            300 = keep 5 minutes
+            900 = keep 15 minutes
+        """
+        size = self.estimate_size(model_name)
+
+        # Large models: unload immediately to free memory
+        if size >= self.LARGE_MODEL_THRESHOLD_GB:
+            return 0
+        # Medium models: keep for 5 minutes
+        elif size >= 4.0:
+            return 300
+        # Small models: keep for 15 minutes
+        else:
+            return 900
+
+
+# Singleton
+_ollama_lifecycle_manager = None
+
+def get_ollama_lifecycle_manager() -> OllamaModelLifecycleManager:
+    """Get or create Ollama lifecycle manager singleton"""
+    global _ollama_lifecycle_manager
+    if _ollama_lifecycle_manager is None:
+        _ollama_lifecycle_manager = OllamaModelLifecycleManager()
+    return _ollama_lifecycle_manager
