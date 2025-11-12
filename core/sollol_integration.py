@@ -347,7 +347,7 @@ class SOLLOLIntegration:
                 options=options,
                 stream=False,
                 priority=priority,
-                routing_mode=routing_mode_enum,
+                routing_mode=routing_mode_enum.value if routing_mode_enum else None,
                 prefer_cpu=prefer_cpu,
                 min_success_rate=min_success_rate
             )
@@ -471,7 +471,7 @@ class SOLLOLIntegration:
                 options=options,
                 stream=True,
                 priority=priority,
-                routing_mode=routing_mode_enum,
+                routing_mode=routing_mode_enum.value if routing_mode_enum else None,
                 prefer_cpu=actual_prefer_cpu,
                 min_success_rate=min_success_rate
             )

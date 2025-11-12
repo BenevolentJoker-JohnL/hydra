@@ -625,7 +625,7 @@ Expected improvements after SOLLOL integration:
 ## Support & Documentation
 
 **SOLLOL Resources**:
-- GitHub: https://github.com/BenevolentJoker-JohnL/SOLLOL
+- GitHub: https://github.com/B-A-M-N/SOLLOL
 - Documentation: /home/joker/SOLLOL/README.md
 - Architecture: /home/joker/SOLLOL/ARCHITECTURE.md
 - Configuration: /home/joker/SOLLOL/CONFIGURATION.md

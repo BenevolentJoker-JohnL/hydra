@@ -273,7 +273,7 @@ python node_agent.py
 For issues or questions:
 
 1. Check logs in `/home/joker/hydra/logs/`
-2. Review SOLLOL documentation: https://github.com/BenevolentJoker-JohnL/SOLLOL
+2. Review SOLLOL documentation: https://github.com/B-A-M-N/SOLLOL
 3. Check Hydra GitHub issues
 4. Enable DEBUG logging for more details
 

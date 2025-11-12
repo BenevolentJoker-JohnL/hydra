@@ -493,7 +493,7 @@ These files remain in place for reference but should not be used in new code.
 
 ## 🎓 Resources
 
-- **SOLLOL GitHub**: https://github.com/BenevolentJoker-JohnL/SOLLOL
+- **SOLLOL GitHub**: https://github.com/B-A-M-N/SOLLOL
 - **SOLLOL Documentation**: Included in SOLLOL package
 - **Hydra Migration Guide**: `SOLLOL_MIGRATION_GUIDE.md`
 - **Integration Code**: `core/sollol_integration.py`

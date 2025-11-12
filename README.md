@@ -54,7 +54,7 @@ ollama pull qwen2.5-coder:7b
 ollama pull llama3.2:latest
 
 # 3. Clone and run
-git clone https://github.com/BenevolentJoker-JohnL/hydra.git
+git clone https://github.com/B-A-M-N/hydra.git
 cd hydra
 pip install -r requirements.txt
 cp .env.example .env
@@ -89,7 +89,7 @@ Create a REST API with FastAPI, SQLAlchemy ORM, user authentication, and compreh
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/BenevolentJoker-JohnL/hydra.git
+git clone https://github.com/B-A-M-N/hydra.git
 cd hydra
 
 # 2. Install Python dependencies
@@ -713,7 +713,7 @@ Use both together for maximum quality on complex tasks.
 - [ ] Collaboration features (shared sessions)
 - [ ] Browser extension for code review
 
-**Vote on features:** [GitHub Discussions](https://github.com/BenevolentJoker-JohnL/hydra/discussions)
+**Vote on features:** [GitHub Discussions](https://github.com/B-A-M-N/hydra/discussions)
 
 ---
 
@@ -816,7 +816,7 @@ Contributions are welcome! Please:
 ### Development Setup
 
 ```bash
-git clone https://github.com/BenevolentJoker-JohnL/hydra.git
+git clone https://github.com/B-A-M-N/hydra.git
 cd hydra
 pip install -r requirements-dev.txt
 pre-commit install
@@ -852,7 +852,7 @@ Under the condition that you:
 
 ## 🙏 Acknowledgments
 
-- **[SOLLOL](https://github.com/BenevolentJoker-JohnL/SOLLOL)** - Distributed inference foundation
+- **[SOLLOL](https://github.com/B-A-M-N/SOLLOL)** - Distributed inference foundation
 - **[Ollama](https://ollama.ai/)** - Local LLM execution made easy
 - **Claude by Anthropic** - Inspiration for reasoning and autonomous patterns
 - **Streamlit** - Rapid UI development framework
@@ -863,8 +863,8 @@ Under the condition that you:
 
 ## 💬 Community
 
-- **GitHub Issues:** [Report bugs & request features](https://github.com/BenevolentJoker-JohnL/hydra/issues)
-- **GitHub Discussions:** [Ask questions & share ideas](https://github.com/BenevolentJoker-JohnL/hydra/discussions)
+- **GitHub Issues:** [Report bugs & request features](https://github.com/B-A-M-N/hydra/issues)
+- **GitHub Discussions:** [Ask questions & share ideas](https://github.com/B-A-M-N/hydra/discussions)
 - **Documentation:** [docs/](docs/)
 
 ---
@@ -873,7 +873,7 @@ Under the condition that you:
 
 If you find Hydra useful, please star the repository! It helps others discover the project.
 
-[![Star History](https://api.star-history.com/svg?repos=BenevolentJoker-JohnL/hydra&type=Date)](https://star-history.com/#BenevolentJoker-JohnL/hydra&Date)
+[![Star History](https://api.star-history.com/svg?repos=B-A-M-N/hydra&type=Date)](https://star-history.com/#B-A-M-N/hydra&Date)
 
 ---
 
